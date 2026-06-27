@@ -401,6 +401,18 @@ label.field > .label {
   background: var(--ok);
   animation: pulse 1.6s ease-in-out infinite;
 }
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
 @keyframes pulse {
   0%, 100% { opacity: 0.6; transform: scale(0.9); }
   50% { opacity: 1; transform: scale(1.15); }

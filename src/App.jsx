@@ -30,7 +30,7 @@ const STOCK = {
 };
 
 // ============ Products ============
-const PRODUCTS = [
+const FALLBACK_PRODUCTS = [
   {
     slug: "heritage-grand",
     name: "Heritage Grand",
@@ -146,6 +146,392 @@ const PRODUCTS = [
     color: "#1C1A17",
   },
 ];
+
+const SHOPIFY_CONFIG = {
+  storeDomain: import.meta.env.VITE_SHOPIFY_STORE_DOMAIN,
+  storefrontToken: import.meta.env.VITE_SHOPIFY_STOREFRONT_PUBLIC_TOKEN,
+  apiVersion: import.meta.env.VITE_SHOPIFY_API_VERSION || "2026-04",
+};
+
+const SHOPIFY_PRODUCTS_QUERY = `
+  query SafarnamaProducts {
+    products(first: 50) {
+      nodes {
+        id
+        handle
+        title
+        description
+        productType
+        tags
+        featuredImage {
+          url
+          altText
+        }
+        images(first: 10) {
+          nodes {
+            url
+            altText
+          }
+        }
+        options {
+          name
+          values
+        }
+        variants(first: 50) {
+          nodes {
+            id
+            title
+            availableForSale
+            price {
+              amount
+              currencyCode
+            }
+            selectedOptions {
+              name
+              value
+            }
+          }
+        }
+        metafields(identifiers: [
+          { namespace: "custom", key: "tagline" }
+          { namespace: "custom", key: "tier" }
+          { namespace: "custom", key: "badge" }
+          { namespace: "custom", key: "rating" }
+          { namespace: "custom", key: "reviews" }
+          { namespace: "custom", key: "color" }
+        ]) {
+          key
+          value
+        }
+      }
+    }
+  }
+`;
+
+const SHOPIFY_CART_CREATE_MUTATION = `
+  mutation CreateSafarnamaCart($input: CartInput!) {
+    cartCreate(input: $input) {
+      cart {
+        id
+        checkoutUrl
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+const ProductDataContext = createContext({
+  products: FALLBACK_PRODUCTS,
+  loading: false,
+  error: null,
+});
+
+function useProducts() {
+  return useContext(ProductDataContext);
+}
+
+function getShopifyEndpoint() {
+  if (!SHOPIFY_CONFIG.storeDomain || !SHOPIFY_CONFIG.storefrontToken) {
+    throw new Error("Missing Shopify environment variables.");
+  }
+  return `https://${SHOPIFY_CONFIG.storeDomain}/api/${SHOPIFY_CONFIG.apiVersion}/graphql.json`;
+}
+
+async function shopifyStorefrontRequest(query, variables = {}, signal) {
+  const response = await fetch(getShopifyEndpoint(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Storefront-Access-Token": SHOPIFY_CONFIG.storefrontToken,
+    },
+    body: JSON.stringify({ query, variables }),
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new Error(`Shopify request failed with ${response.status}`);
+  }
+
+  const payload = await response.json();
+  if (payload.errors?.length) {
+    throw new Error(payload.errors.map((err) => err.message).join("; "));
+  }
+
+  return payload.data;
+}
+
+function useShopifyProducts() {
+  const [state, setState] = useState({
+    products: FALLBACK_PRODUCTS,
+    loading: true,
+    error: null,
+  });
+
+  useEffect(() => {
+    if (!SHOPIFY_CONFIG.storeDomain || !SHOPIFY_CONFIG.storefrontToken) {
+      setState({ products: FALLBACK_PRODUCTS, loading: false, error: "Missing Shopify environment variables." });
+      return;
+    }
+
+    const controller = new AbortController();
+
+    async function fetchProducts() {
+      try {
+        const data = await shopifyStorefrontRequest(SHOPIFY_PRODUCTS_QUERY, {}, controller.signal);
+        const shopifyProducts = (data?.products?.nodes || [])
+          .map(mapShopifyProduct)
+          .filter(Boolean);
+
+        setState({
+          products: shopifyProducts.length ? shopifyProducts : FALLBACK_PRODUCTS,
+          loading: false,
+          error: null,
+        });
+      } catch (err) {
+        if (err.name === "AbortError") return;
+        console.error("Unable to load Shopify products", err);
+        setState({ products: FALLBACK_PRODUCTS, loading: false, error: err.message });
+      }
+    }
+
+    fetchProducts();
+    return () => controller.abort();
+  }, []);
+
+  return state;
+}
+
+function mapShopifyProduct(product, index) {
+  const fallback = FALLBACK_PRODUCTS[index % FALLBACK_PRODUCTS.length];
+  const images = product.images?.nodes?.map((image) => image.url).filter(Boolean) || [];
+  const variants = (product.variants?.nodes || []).map(mapShopifyVariant);
+  const prices = variants
+    .map((variant) => variant.price)
+    .filter((amount) => Number.isFinite(amount));
+  const currency = variants.find((variant) => variant.currency)?.currency || "AUD";
+
+  const sizes = getOptionValues(product, ["size"]) || fallback.sizes;
+  const pages = getPageValues(product) || fallback.pages;
+  const cover = getOptionValues(product, ["cover", "material"]) || fallback.cover;
+  const paper = getOptionValues(product, ["paper", "quality"]) || fallback.paper;
+  const tier = getMetafield(product, "tier") || getTierFromTags(product.tags) || fallback.tier;
+  const description = (product.description || "").trim();
+
+  return {
+    slug: product.handle,
+    name: product.title,
+    tagline: getMetafield(product, "tagline") || excerptText(description) || fallback.tagline,
+    price: prices.length ? Math.min(...prices) : fallback.price,
+    currency,
+    sizes,
+    pages,
+    cover,
+    paper,
+    variants,
+    image: product.featuredImage?.url || images[0] || fallback.image,
+    images: images.length ? images : fallback.images,
+    rating: Number.parseFloat(getMetafield(product, "rating")) || fallback.rating,
+    reviews: Number.parseInt(getMetafield(product, "reviews"), 10) || fallback.reviews,
+    tier,
+    badge: getMetafield(product, "badge") || (product.tags || []).find((tag) => /new|bestseller|sale/i.test(tag)),
+    color: getMetafield(product, "color") || fallback.color,
+  };
+}
+
+function mapShopifyVariant(variant) {
+  return {
+    id: variant.id,
+    title: variant.title,
+    availableForSale: variant.availableForSale,
+    price: Number.parseFloat(variant.price?.amount),
+    currency: variant.price?.currencyCode || "AUD",
+    selectedOptions: variant.selectedOptions || [],
+  };
+}
+
+function getMetafield(product, key) {
+  return product.metafields?.find((field) => field?.key === key)?.value?.trim();
+}
+
+function getTierFromTags(tags = []) {
+  return tags.find((tag) => /^(Petite|Signature|Heritage)$/i.test(tag));
+}
+
+function getOptionValues(product, names) {
+  const optionValues = product.options
+    ?.find((option) => names.some((name) => option.name.toLowerCase().includes(name)))
+    ?.values
+    ?.filter((value) => value && value !== "Default Title");
+
+  if (optionValues?.length) return optionValues;
+
+  const variantValues = product.variants?.nodes
+    ?.flatMap((variant) => variant.selectedOptions || [])
+    ?.filter((option) => names.some((name) => option.name.toLowerCase().includes(name)))
+    ?.map((option) => option.value)
+    ?.filter((value) => value && value !== "Default Title");
+
+  return uniqueValues(variantValues);
+}
+
+function getPageValues(product) {
+  const rawValues = getOptionValues(product, ["page"]);
+  const pages = rawValues
+    ?.map((value) => Number.parseInt(String(value).match(/\d+/)?.[0], 10))
+    ?.filter((value) => Number.isFinite(value))
+    ?.sort((a, b) => a - b);
+
+  return uniqueValues(pages);
+}
+
+function uniqueValues(values = []) {
+  const unique = [...new Set(values)];
+  return unique.length ? unique : null;
+}
+
+function excerptText(text, limit = 132) {
+  if (!text) return "";
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, limit).replace(/\s+\S*$/, "")}...`;
+}
+
+function formatCurrency(amount, currency = "AUD") {
+  return new Intl.NumberFormat("en-AU", {
+    style: "currency",
+    currency,
+    maximumFractionDigits: amount % 1 === 0 ? 0 : 2,
+  }).format(amount);
+}
+
+function getConfiguredUnitPrice(product, pages, cover) {
+  return product.price + (pages > 40 ? (pages - 40) * 4 : 0) + (cover.includes("leather") || cover.includes("silk") || cover.includes("Brocade") ? 60 : 0);
+}
+
+function cartItemKey({ slug, size, pages, cover, paper }) {
+  return [slug, size, pages, cover, paper].join("::");
+}
+
+function buildCartItem({ product, size, pages, cover, paper, qty }) {
+  const variant = findMatchingVariant(product, { size, pages, cover, paper });
+  const price = variant?.price || getConfiguredUnitPrice(product, pages, cover);
+  const key = cartItemKey({ slug: product.slug, size, pages, cover, paper });
+  const configParts = [size, `${pages} pages`, cover, paper].filter(Boolean);
+
+  return {
+    id: key,
+    slug: product.slug,
+    name: product.name,
+    tier: product.tier,
+    config: configParts.join(" · "),
+    details: { size, pages, cover, paper },
+    price,
+    currency: product.currency || "AUD",
+    variantId: variant?.id,
+    variantTitle: variant?.title,
+    qty,
+    status: "Awaiting photos",
+    thumb: product.image,
+    project: "New album",
+  };
+}
+
+function cartItemCount(items) {
+  return items.reduce((sum, item) => sum + item.qty, 0);
+}
+
+function normalizeOption(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function optionMatches(selectedOption, names, value) {
+  if (!value) return false;
+  const optionName = selectedOption.name.toLowerCase();
+  return names.some((name) => optionName.includes(name)) && normalizeOption(selectedOption.value) === normalizeOption(value);
+}
+
+function findMatchingVariant(product, selections) {
+  const variants = product.variants || [];
+  if (!variants.length) return null;
+
+  const available = variants.filter((variant) => variant.availableForSale);
+  const candidates = available.length ? available : variants;
+  const desiredOptions = [
+    { names: ["size"], value: selections.size },
+    { names: ["page"], value: selections.pages },
+    { names: ["cover", "material"], value: selections.cover },
+    { names: ["paper", "quality"], value: selections.paper },
+  ];
+
+  const scored = candidates.map((variant) => {
+    const score = desiredOptions.reduce((total, desired) => {
+      return total + (variant.selectedOptions.some((option) => optionMatches(option, desired.names, desired.value)) ? 1 : 0);
+    }, 0);
+    return { variant, score };
+  });
+
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.variant.availableForSale !== b.variant.availableForSale) return a.variant.availableForSale ? -1 : 1;
+    return (a.variant.price || Infinity) - (b.variant.price || Infinity);
+  });
+
+  return scored[0]?.variant || null;
+}
+
+function createShopifyCartAttributes(item) {
+  return [
+    ["Product", item.name],
+    ["Selected size", item.details?.size],
+    ["Selected pages", item.details?.pages ? `${item.details.pages} pages` : ""],
+    ["Selected cover", item.details?.cover],
+    ["Selected paper", item.details?.paper],
+    ["Variant", item.variantTitle],
+  ]
+    .filter(([, value]) => value)
+    .map(([key, value]) => ({ key, value: String(value) }));
+}
+
+async function createShopifyCheckout(items) {
+  if (!items.length) {
+    throw new Error("Your cart is empty.");
+  }
+
+  const lines = items.map((item) => {
+    if (!item.variantId) {
+      throw new Error(`${item.name} is missing a Shopify variant and cannot be checked out yet.`);
+    }
+
+    return {
+      merchandiseId: item.variantId,
+      quantity: item.qty,
+      attributes: createShopifyCartAttributes(item),
+    };
+  });
+
+  const data = await shopifyStorefrontRequest(SHOPIFY_CART_CREATE_MUTATION, {
+    input: {
+      lines,
+      attributes: [
+        { key: "Source", value: "Safarnama React cart" },
+      ],
+    },
+  });
+  const userErrors = data?.cartCreate?.userErrors || [];
+  if (userErrors.length) {
+    throw new Error(userErrors.map((error) => error.message).join("; "));
+  }
+
+  const checkoutUrl = data?.cartCreate?.cart?.checkoutUrl;
+  if (!checkoutUrl) {
+    throw new Error("Shopify did not return a checkout URL.");
+  }
+
+  return checkoutUrl;
+}
 
 const TESTIMONIALS = [
   {
@@ -351,7 +737,7 @@ function SmartImage({ src, alt, className, style }) {
 // expose
 Object.assign(window, {
   React, useState, useEffect, useRef, useMemo,
-  STOCK, PRODUCTS, TESTIMONIALS, REVIEW_SOURCES,
+  STOCK, PRODUCTS: FALLBACK_PRODUCTS, TESTIMONIALS, REVIEW_SOURCES,
   Logo, Stars, TopNav, Footer, SmartImage,
 });
 
@@ -916,6 +1302,7 @@ Object.assign(window, {
 const { useState: useStateHome, useEffect: useEffectHome } = React;
 
 function HomePage({ navigate, tweaks }) {
+  const { products } = useProducts();
   const heroVariant = tweaks.heroVariant || "image";
   const cardStyle = tweaks.cardStyle || "tall";
 
@@ -956,7 +1343,7 @@ function HomePage({ navigate, tweaks }) {
             <a className="btn btn-ghost" onClick={() => navigate("shop")}>View all books →</a>
           </div>
           <div className={cardStyle === "tall" ? "products-grid-tall" : "products-grid-wide"}>
-            {PRODUCTS.slice(0, 4).map((p, i) => (
+            {products.slice(0, 4).map((p, i) => (
               <ProductCard key={p.slug} product={p} navigate={navigate} variant={cardStyle} index={i} />
             ))}
           </div>
@@ -1322,10 +1709,12 @@ Object.assign(window, { HomePage, ProductCard, ArticleCard, StudioPreview, HeroI
 // ===== page-shop.jsx =====
 // Shop / PLP and Product Detail page
 function ShopPage({ navigate, tweaks }) {
+  const { products } = useProducts();
   const [filters, setFilters] = useState({ tier: "All", sort: "Featured" });
   const [view, setView] = useState("grid");
 
-  const filtered = filters.tier === "All" ? PRODUCTS : PRODUCTS.filter(p => p.tier === filters.tier);
+  const tiers = ["All", ...new Set(products.map(p => p.tier).filter(Boolean))];
+  const filtered = filters.tier === "All" ? products : products.filter(p => p.tier === filters.tier);
   const sorted = [...filtered].sort((a, b) => {
     if (filters.sort === "Price: Low") return a.price - b.price;
     if (filters.sort === "Price: High") return b.price - a.price;
@@ -1359,7 +1748,7 @@ function ShopPage({ navigate, tweaks }) {
       <section style={{ padding: "20px 0 40px", borderTop: "1px solid var(--line)", borderBottom: "1px solid var(--line)", position: "sticky", top: 96, zIndex: 10, background: "rgba(244,239,230,0.92)", backdropFilter: "blur(10px)" }}>
         <div className="container" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 24 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {["All", "Petite", "Signature", "Heritage"].map(t => (
+            {tiers.map(t => (
               <button key={t} className={`tag ${filters.tier === t ? "dark" : ""}`} style={{ cursor: "pointer", padding: "8px 14px" }} onClick={() => setFilters({...filters, tier: t})}>{t}</button>
             ))}
           </div>
@@ -1506,16 +1895,52 @@ function ComparisonTable() {
 }
 
 // ============ Product Detail ============
-function ProductPage({ navigate, params }) {
-  const product = PRODUCTS.find(p => p.slug === params?.slug) || PRODUCTS[0];
+function ProductPage({ navigate, params, onAddToCart }) {
+  const { products } = useProducts();
+  const product = products.find(p => p.slug === params?.slug) || products[0];
   const [size, setSize] = useState(product.sizes[0]);
   const [pages, setPages] = useState(product.pages[1] || product.pages[0]);
   const [cover, setCover] = useState(product.cover[0]);
   const [paper, setPaper] = useState(product.paper[0]);
   const [qty, setQty] = useState(1);
   const [activeImg, setActiveImg] = useState(0);
+  const [added, setAdded] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const addedTimer = useRef(null);
+  const addingTimer = useRef(null);
 
-  const total = product.price + (pages > 40 ? (pages - 40) * 4 : 0) + (cover.includes("leather") || cover.includes("silk") || cover.includes("Brocade") ? 60 : 0);
+  useEffect(() => {
+    setSize(product.sizes[0]);
+    setPages(product.pages[1] || product.pages[0]);
+    setCover(product.cover[0]);
+    setPaper(product.paper[0]);
+    setActiveImg(0);
+    setAdded(false);
+    setAdding(false);
+  }, [product.slug]);
+
+  useEffect(() => () => {
+    clearTimeout(addedTimer.current);
+    clearTimeout(addingTimer.current);
+  }, []);
+
+  const selectedVariant = findMatchingVariant(product, { size, pages, cover, paper });
+  const unitPrice = selectedVariant?.price || getConfiguredUnitPrice(product, pages, cover);
+  const total = unitPrice * qty;
+  const addCurrentSelectionToCart = () => {
+    if (adding) return;
+    clearTimeout(addedTimer.current);
+    clearTimeout(addingTimer.current);
+    setAdding(true);
+    setAdded(false);
+
+    addingTimer.current = setTimeout(() => {
+      onAddToCart(buildCartItem({ product, size, pages, cover, paper, qty }));
+      setAdding(false);
+      setAdded(true);
+      addedTimer.current = setTimeout(() => setAdded(false), 4200);
+    }, 650);
+  };
 
   return (
     <div className="product-page">
@@ -1570,16 +1995,28 @@ function ProductPage({ navigate, params }) {
               <div style={{ marginTop: 32, padding: 24, background: "var(--bg-2)", borderRadius: "var(--r-md)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div>
                   <div style={{ fontSize: 12, color: "var(--muted)", letterSpacing: 0.04, textTransform: "uppercase" }}>Total</div>
-                  <div style={{ fontSize: 36, letterSpacing: "-0.025em", lineHeight: 1, marginTop: 6 }}>${total}<span style={{ fontSize: 14, color: "var(--muted)", marginLeft: 6 }}>AUD</span></div>
-                  <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6 }}>or 4 × ${Math.round(total/4)} with Afterpay</div>
+                  <div style={{ fontSize: 36, letterSpacing: "-0.025em", lineHeight: 1, marginTop: 6 }}>{formatCurrency(total, product.currency)}<span style={{ fontSize: 14, color: "var(--muted)", marginLeft: 6 }}>{product.currency || "AUD"}</span></div>
+                  <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6 }}>or 4 × {formatCurrency(Math.round(total/4), product.currency)} with Afterpay</div>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                   <button className="btn btn-primary btn-lg" onClick={() => navigate("upload", { slug: product.slug })}>
                     Begin uploading photos →
                   </button>
-                  <button className="btn btn-ghost btn-sm" onClick={() => navigate("cart")}>Add to cart for later</button>
+                  <button className="btn btn-ghost btn-sm" onClick={addCurrentSelectionToCart} disabled={adding} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: adding ? 0.78 : 1 }}>
+                    {adding && <span className="spinner" aria-hidden="true"></span>}
+                    {adding ? "Adding..." : added ? "Added to cart" : "Add to cart for later"}
+                  </button>
                 </div>
               </div>
+              {added && (
+                <div className="fade-in" style={{ marginTop: 12, padding: "12px 14px", border: "1px solid var(--line-2)", borderRadius: "var(--r-md)", background: "var(--paper)", display: "flex", gap: 10, alignItems: "start", fontSize: 13, color: "var(--ink-3)" }}>
+                  <span style={{ width: 20, height: 20, borderRadius: "50%", background: "var(--ok)", color: "white", display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0, fontSize: 12 }}>✓</span>
+                  <div>
+                    <strong style={{ color: "var(--ink)" }}>Added to cart.</strong>
+                    <div style={{ marginTop: 2 }}>{qty} × {product.name} · {size} · {pages} pages · {cover} · {paper}</div>
+                  </div>
+                </div>
+              )}
 
               <div style={{ marginTop: 24, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, fontSize: 13, color: "var(--ink-3)" }}>
                 <div style={{ display: "flex", gap: 10, alignItems: "start" }}>
@@ -1637,7 +2074,7 @@ function ProductPage({ navigate, params }) {
         <div className="container">
           <h2 className="headline" style={{ marginBottom: 40, fontSize: "clamp(28px, 3vw, 40px)" }}>You might also like</h2>
           <div className="products-grid-tall">
-            {PRODUCTS.filter(p => p.slug !== product.slug).slice(0, 4).map(p => <ProductCard key={p.slug} product={p} navigate={navigate} />)}
+            {products.filter(p => p.slug !== product.slug).slice(0, 4).map(p => <ProductCard key={p.slug} product={p} navigate={navigate} />)}
           </div>
         </div>
       </section>
@@ -1727,7 +2164,8 @@ Object.assign(window, { ShopPage, ProductPage, ProductRow, FilterPopover, Compar
 // ===== page-studio.jsx =====
 // Photo upload + Design Studio (deep editor)
 function UploadPage({ navigate, params }) {
-  const product = PRODUCTS.find(p => p.slug === params?.slug) || PRODUCTS[0];
+  const { products } = useProducts();
+  const product = products.find(p => p.slug === params?.slug) || products[0];
   const [files, setFiles] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const [uploadingIdx, setUploadingIdx] = useState(-1);
@@ -1913,7 +2351,8 @@ function Stepper({ current, navigate, slug }) {
 
 // ============ DESIGN STUDIO (deep) ============
 function StudioPage({ navigate, params }) {
-  const product = PRODUCTS.find(p => p.slug === params?.slug) || PRODUCTS[0];
+  const { products } = useProducts();
+  const product = products.find(p => p.slug === params?.slug) || products[0];
   const [activeTool, setActiveTool] = useState("layouts");
   const [activeSpread, setActiveSpread] = useState(2);
   const [activeLayout, setActiveLayout] = useState("full-bleed");
@@ -2345,16 +2784,27 @@ Object.assign(window, { UploadPage, Stepper, StudioPage, StudioTopbar, StudioRai
 
 // ===== page-cart-checkout.jsx =====
 // Cart, Checkout, Confirmation, Account
-function CartPage({ navigate }) {
-  const [items, setItems] = useState([
-    { id: 1, slug: "anika-folio", name: "The Heritage Folio", config: "12×12 in · 60 pages · Linen, Sand", price: 549, qty: 1, status: "Designed", thumb: STOCK.weddingCouple, project: "Anika & Ravi · December 2025" },
-    { id: 2, slug: "souvenir", name: "The Souvenir Album", config: "8×8 in · 40 pages · Block-print silk", price: 419, qty: 1, status: "In studio", thumb: STOCK.travelTaj, project: "Rajasthan, October 2025" },
-    { id: 3, slug: "petite", name: "The Petite", config: "6×6 in · 24 pages · Linen, Saffron", price: 199, qty: 2, status: "Awaiting photos", thumb: STOCK.family, project: "First year · Aarav" },
-  ]);
-
+function CartPage({ navigate, items, setItems }) {
+  const [checkoutLoading, setCheckoutLoading] = useState(false);
+  const [checkoutError, setCheckoutError] = useState("");
   const subtotal = items.reduce((s, i) => s + i.price * i.qty, 0);
-  const shipping = subtotal > 400 ? 0 : 25;
+  const shipping = subtotal === 0 || subtotal > 400 ? 0 : 25;
   const total = subtotal + shipping;
+  const totalItems = cartItemCount(items);
+  const handleShopifyCheckout = async () => {
+    if (!items.length || checkoutLoading) return;
+
+    setCheckoutLoading(true);
+    setCheckoutError("");
+
+    try {
+      const checkoutUrl = await createShopifyCheckout(items);
+      window.location.href = checkoutUrl;
+    } catch (err) {
+      setCheckoutError(err.message || "Unable to start Shopify checkout.");
+      setCheckoutLoading(false);
+    }
+  };
 
   return (
     <div className="cart-page">
@@ -2363,41 +2813,54 @@ function CartPage({ navigate }) {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "end", marginBottom: 40 }}>
             <div>
               <span className="eyebrow">Your projects</span>
-              <h1 className="headline" style={{ marginTop: 12 }}>Cart · {items.length} books in progress.</h1>
+              <h1 className="headline" style={{ marginTop: 12 }}>Cart · {totalItems} {totalItems === 1 ? "book" : "books"} in progress.</h1>
             </div>
             <a className="btn btn-ghost" onClick={() => navigate("shop")}>← Continue shopping</a>
           </div>
 
           <div style={{ display: "grid", gridTemplateColumns: "1fr 380px", gap: 60 }}>
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-              {items.map(item => (
-                <CartItem key={item.id} item={item} navigate={navigate} setItems={setItems} items={items} />
-              ))}
+              {items.length ? (
+                <>
+                  {items.map(item => (
+                    <CartItem key={item.id} item={item} navigate={navigate} setItems={setItems} items={items} />
+                  ))}
 
-              <div style={{ marginTop: 24, padding: 24, background: "var(--bg-2)", borderRadius: "var(--r-md)", display: "flex", gap: 16, alignItems: "center" }}>
-                <div style={{ width: 44, height: 44, borderRadius: "50%", background: "var(--accent)", color: "white", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>✦</div>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 15, marginBottom: 2 }}>Add a personalised slipcase to any Heritage book</div>
-                  <div style={{ fontSize: 13, color: "var(--ink-3)" }}>Foiled with the title of your choice. +$80 AUD.</div>
+                  <div style={{ marginTop: 24, padding: 24, background: "var(--bg-2)", borderRadius: "var(--r-md)", display: "flex", gap: 16, alignItems: "center" }}>
+                    <div style={{ width: 44, height: 44, borderRadius: "50%", background: "var(--accent)", color: "white", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>✦</div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 15, marginBottom: 2 }}>Add a personalised slipcase to any Heritage book</div>
+                      <div style={{ fontSize: 13, color: "var(--ink-3)" }}>Foiled with the title of your choice. +$80 AUD.</div>
+                    </div>
+                    <button className="btn btn-ghost btn-sm">Add to order</button>
+                  </div>
+                </>
+              ) : (
+                <div className="card" style={{ padding: 48, minHeight: 360, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", textAlign: "center" }}>
+                  <div style={{ width: 72, height: 72, borderRadius: "50%", background: "var(--bg-2)", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 20 }}>
+                    <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M3 5h2.5l2.5 11h11l2-8H7"/><circle cx="9" cy="20" r="1.5"/><circle cx="18" cy="20" r="1.5"/></svg>
+                  </div>
+                  <h2 style={{ fontSize: 28, letterSpacing: "-0.02em", margin: "0 0 10px" }}>Your cart is empty.</h2>
+                  <p style={{ fontSize: 14, color: "var(--ink-3)", maxWidth: 420, lineHeight: 1.6, margin: "0 0 24px" }}>Choose a book, select the details that feel right, and it will appear here ready for upload or checkout.</p>
+                  <button className="btn btn-primary" onClick={() => navigate("shop")}>Browse books</button>
                 </div>
-                <button className="btn btn-ghost btn-sm">Add to order</button>
-              </div>
+              )}
             </div>
 
             <aside style={{ position: "sticky", top: 120, alignSelf: "start" }}>
               <div className="card" style={{ padding: 28 }}>
                 <h3 style={{ fontSize: 18, margin: "0 0 20px", letterSpacing: "-0.015em" }}>Order summary</h3>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10, fontSize: 14, marginBottom: 20 }}>
-                  <SummaryRow label={`Subtotal (${items.reduce((s,i)=>s+i.qty,0)} items)`} value={`$${subtotal}`} />
-                  <SummaryRow label="Shipping" value={shipping === 0 ? "Free" : `$${shipping}`} note={shipping === 0 ? "On orders over $400" : ""} />
+                  <SummaryRow label={`Subtotal (${totalItems} ${totalItems === 1 ? "item" : "items"})`} value={formatCurrency(subtotal)} />
+                  <SummaryRow label="Shipping" value={shipping === 0 ? "Free" : formatCurrency(shipping)} note={subtotal > 400 ? "On orders over $400" : ""} />
                   <SummaryRow label="Estimated GST" value="Included" />
                 </div>
                 <div style={{ paddingTop: 20, borderTop: "1px solid var(--line)", marginBottom: 24 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                     <span style={{ fontSize: 14 }}>Total</span>
                     <div style={{ textAlign: "right" }}>
-                      <div style={{ fontSize: 32, letterSpacing: "-0.025em", lineHeight: 1 }}>${total}</div>
-                      <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>AUD · or 4 × ${Math.round(total/4)} with Afterpay</div>
+                      <div style={{ fontSize: 32, letterSpacing: "-0.025em", lineHeight: 1 }}>{formatCurrency(total)}</div>
+                      <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>AUD · or 4 × {formatCurrency(Math.round(total/4))} with Afterpay</div>
                     </div>
                   </div>
                 </div>
@@ -2407,13 +2870,26 @@ function CartPage({ navigate }) {
                     <button className="btn btn-ghost">Apply</button>
                   </div>
                 </div>
-                <button className="btn btn-primary" style={{ width: "100%" }} onClick={() => navigate("checkout")}>Proceed to checkout →</button>
+                {checkoutError && (
+                  <div className="fade-in" style={{ marginBottom: 14, padding: "10px 12px", borderRadius: "var(--r-sm)", border: "1px solid rgba(168,87,48,0.25)", background: "rgba(168,87,48,0.08)", color: "var(--rust)", fontSize: 12, lineHeight: 1.45 }}>
+                    {checkoutError}
+                  </div>
+                )}
+                <button
+                  className="btn btn-primary"
+                  disabled={!items.length || checkoutLoading}
+                  style={{ width: "100%", opacity: items.length ? 1 : 0.45, pointerEvents: items.length ? "auto" : "none", display: "inline-flex", justifyContent: "center", alignItems: "center", gap: 8 }}
+                  onClick={handleShopifyCheckout}
+                >
+                  {checkoutLoading && <span className="spinner" aria-hidden="true"></span>}
+                  {checkoutLoading ? "Opening Shopify checkout..." : "Proceed to Shopify checkout →"}
+                </button>
                 <div style={{ marginTop: 16, display: "flex", justifyContent: "center", gap: 14, fontSize: 11, color: "var(--muted)" }}>
                   <span>🔒 Secure checkout</span>
                   <span>·</span>
-                  <span>Stripe</span>
+                  <span>Shopify</span>
                   <span>·</span>
-                  <span>Afterpay</span>
+                  <span>Tracked order</span>
                 </div>
               </div>
 
@@ -2437,23 +2913,33 @@ function CartItem({ item, navigate, setItems, items }) {
         <SmartImage src={item.thumb} className="img-fill" />
       </div>
       <div>
-        <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 4 }}>Project · {item.project}</div>
+        <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 4 }}>{item.tier || "Album"} · {item.project}</div>
         <h3 style={{ fontSize: 20, margin: "0 0 6px", letterSpacing: "-0.015em" }}>{item.name}</h3>
         <div style={{ fontSize: 13, color: "var(--ink-3)", marginBottom: 14 }}>{item.config}</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 16 }}>
+          {[
+            item.details?.size,
+            item.details?.pages ? `${item.details.pages} pages` : "",
+            item.details?.cover,
+            item.details?.paper,
+          ].filter(Boolean).map(detail => (
+            <span key={detail} className="tag" style={{ fontSize: 11 }}>{detail}</span>
+          ))}
+        </div>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
           <span style={{ width: 6, height: 6, borderRadius: "50%", background: statusColor }}></span>
           <span style={{ fontSize: 12, color: statusColor }}>{item.status}</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button className="btn btn-ghost btn-sm" onClick={() => navigate("studio", { slug: item.slug })}>Edit in Studio</button>
-          <button className="btn btn-ghost btn-sm">Duplicate</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => setItems(items.map(i => i.id === item.id ? {...i, qty: i.qty+1} : i))}>Duplicate</button>
           <button className="btn btn-ghost btn-sm" style={{ color: "var(--rust)" }} onClick={() => setItems(items.filter(i => i.id !== item.id))}>Remove</button>
         </div>
       </div>
       <div style={{ textAlign: "right", display: "flex", flexDirection: "column", justifyContent: "space-between", alignItems: "end" }}>
         <div>
-          <div style={{ fontSize: 22, letterSpacing: "-0.015em" }}>${item.price * item.qty}</div>
-          <div style={{ fontSize: 11, color: "var(--muted)" }}>${item.price} × {item.qty}</div>
+          <div style={{ fontSize: 22, letterSpacing: "-0.015em" }}>{formatCurrency(item.price * item.qty, item.currency)}</div>
+          <div style={{ fontSize: 11, color: "var(--muted)" }}>{formatCurrency(item.price, item.currency)} × {item.qty}</div>
         </div>
         <div style={{ display: "inline-flex", alignItems: "center", border: "1px solid var(--line-2)", borderRadius: "var(--r-pill)" }}>
           <button onClick={() => setItems(items.map(i => i.id === item.id ? {...i, qty: Math.max(1, i.qty-1)} : i))} style={{ width: 32, height: 32 }}>−</button>
@@ -2478,7 +2964,7 @@ function SummaryRow({ label, value, note }) {
 }
 
 // ============ CHECKOUT ============
-function CheckoutPage({ navigate }) {
+function CheckoutPage({ navigate, items = [] }) {
   const [step, setStep] = useState("delivery"); // delivery, payment, review
   const [delivery, setDelivery] = useState({
     name: "Priya Sharma", email: "priya@example.com", phone: "+61 412 778 933",
@@ -2486,6 +2972,10 @@ function CheckoutPage({ navigate }) {
   });
   const [special, setSpecial] = useState("Please include a small note: 'For Mum & Dad — Diwali 2026.' Wrap in our brown paper, no plastic.");
   const [shipping, setShipping] = useState("standard");
+  const subtotal = items.reduce((sum, item) => sum + item.price * item.qty, 0);
+  const shippingCost = subtotal === 0 || subtotal > 400 ? 0 : 25;
+  const total = subtotal + shippingCost;
+  const totalItems = cartItemCount(items);
 
   return (
     <div className="checkout-page">
@@ -2525,32 +3015,35 @@ function CheckoutPage({ navigate }) {
 
             <aside style={{ position: "sticky", top: 40, alignSelf: "start" }}>
               <div className="card" style={{ padding: 24 }}>
-                <div style={{ fontSize: 12, color: "var(--muted)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 16 }}>3 books in your order</div>
-                {[
-                  { name: "Heritage Folio", thumb: STOCK.weddingCouple, qty: 1, price: 549 },
-                  { name: "Souvenir Album", thumb: STOCK.travelTaj, qty: 1, price: 419 },
-                  { name: "Petite × 2", thumb: STOCK.family, qty: 2, price: 199 },
-                ].map((b, i) => (
-                  <div key={i} style={{ display: "flex", gap: 12, marginBottom: 16, alignItems: "center" }}>
-                    <div style={{ width: 56, height: 56, borderRadius: "var(--r-sm)", overflow: "hidden", flexShrink: 0 }}>
-                      <SmartImage src={b.thumb} className="img-fill" />
+                <div style={{ fontSize: 12, color: "var(--muted)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 16 }}>{totalItems} {totalItems === 1 ? "book" : "books"} in your order</div>
+                {items.length ? (
+                  items.map((b) => (
+                    <div key={b.id} style={{ display: "flex", gap: 12, marginBottom: 16, alignItems: "center" }}>
+                      <div style={{ width: 56, height: 56, borderRadius: "var(--r-sm)", overflow: "hidden", flexShrink: 0 }}>
+                        <SmartImage src={b.thumb} className="img-fill" />
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 14 }}>{b.name}</div>
+                        <div style={{ fontSize: 12, color: "var(--muted)", lineHeight: 1.4 }}>{b.config}</div>
+                        <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>Qty {b.qty}</div>
+                      </div>
+                      <div style={{ fontSize: 14 }}>{formatCurrency(b.price * b.qty, b.currency)}</div>
                     </div>
-                    <div style={{ flex: 1 }}>
-                      <div style={{ fontSize: 14 }}>{b.name}</div>
-                      <div style={{ fontSize: 12, color: "var(--muted)" }}>Qty {b.qty}</div>
-                    </div>
-                    <div style={{ fontSize: 14 }}>${b.price * b.qty}</div>
+                  ))
+                ) : (
+                  <div style={{ padding: "28px 0", textAlign: "center", color: "var(--ink-3)", fontSize: 13, lineHeight: 1.6 }}>
+                    Your order is empty. Return to the shop to choose a book before checkout.
                   </div>
-                ))}
+                )}
                 <hr className="hr" style={{ margin: "16px 0" }} />
-                <SummaryRow label="Subtotal" value="$1,366" />
-                <SummaryRow label="Shipping" value="Free" />
+                <SummaryRow label="Subtotal" value={formatCurrency(subtotal)} />
+                <SummaryRow label="Shipping" value={shippingCost === 0 ? "Free" : formatCurrency(shippingCost)} />
                 <SummaryRow label="GST" value="Included" />
                 <hr className="hr" style={{ margin: "16px 0" }} />
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
                   <span>Total</span>
                   <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: 28, letterSpacing: "-0.025em" }}>$1,366</div>
+                    <div style={{ fontSize: 28, letterSpacing: "-0.025em" }}>{formatCurrency(total)}</div>
                     <div style={{ fontSize: 11, color: "var(--muted)" }}>AUD</div>
                   </div>
                 </div>
@@ -3381,6 +3874,20 @@ function App() {
   const [page, setPage] = React.useState("home");
   const [params, setParams] = React.useState({});
   const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
+  const productData = useShopifyProducts();
+  const [cartItems, setCartItems] = React.useState([]);
+
+  const addToCart = React.useCallback((item) => {
+    setCartItems((current) => {
+      const existing = current.find((cartItem) => cartItem.id === item.id);
+      if (existing) {
+        return current.map((cartItem) => (
+          cartItem.id === item.id ? { ...cartItem, qty: cartItem.qty + item.qty } : cartItem
+        ));
+      }
+      return [...current, item];
+    });
+  }, []);
 
   React.useEffect(() => {
     // hash router
@@ -3444,11 +3951,11 @@ function App() {
   let content;
   if (page === "home") content = <HomePage navigate={navigate} tweaks={tweaks} />;
   else if (page === "shop") content = <ShopPage navigate={navigate} tweaks={tweaks} />;
-  else if (page === "product") content = <ProductPage navigate={navigate} params={params} />;
+  else if (page === "product") content = <ProductPage navigate={navigate} params={params} onAddToCart={addToCart} />;
   else if (page === "upload") content = <UploadPage navigate={navigate} params={params} />;
   else if (page === "studio") content = <StudioPage navigate={navigate} params={params} />;
-  else if (page === "cart") content = <CartPage navigate={navigate} />;
-  else if (page === "checkout") content = <CheckoutPage navigate={navigate} />;
+  else if (page === "cart") content = <CartPage navigate={navigate} items={cartItems} setItems={setCartItems} />;
+  else if (page === "checkout") content = <CheckoutPage navigate={navigate} items={cartItems} />;
   else if (page === "confirmation") content = <ConfirmationPage navigate={navigate} />;
   else if (page === "account") content = <AccountPage navigate={navigate} />;
   else if (page === "about") content = <AboutPage navigate={navigate} />;
@@ -3459,35 +3966,37 @@ function App() {
   else content = <HomePage navigate={navigate} tweaks={tweaks} />;
 
   return (
-    <div data-screen-label={pageLabel(page)} data-page={page}>
-      {showShell && <TopNav active={page} navigate={navigate} cartCount={3} />}
-      {content}
-      {showShell && <Footer navigate={navigate} />}
+    <ProductDataContext.Provider value={productData}>
+      <div data-screen-label={pageLabel(page)} data-page={page}>
+        {showShell && <TopNav active={page} navigate={navigate} cartCount={cartItemCount(cartItems)} />}
+        {content}
+        {showShell && <Footer navigate={navigate} />}
 
-      <TweaksPanel title="Tweaks">
-          <TweakSection title="Palette">
-            <TweakColor label="Color palette" value={tweaks.palette} options={PALETTES} onChange={(v) => setTweak("palette", v)} />
-          </TweakSection>
-          <TweakSection title="Typography">
-            <TweakSelect label="Font family" value={tweaks.fontFamily} options={FONT_OPTIONS} onChange={(v) => setTweak("fontFamily", v)} />
-          </TweakSection>
-          <TweakSection title="Layout">
-            <TweakRadio label="Hero variant" value={tweaks.heroVariant} options={[{value:"image",label:"Image-led"},{value:"type",label:"Type-led"}]} onChange={(v) => setTweak("heroVariant", v)} />
-            <TweakRadio label="Product cards" value={tweaks.cardStyle} options={[{value:"tall",label:"Tall"},{value:"wide",label:"Wide"}]} onChange={(v) => setTweak("cardStyle", v)} />
-            <TweakSelect label="Radius scale" value={tweaks.radius} options={["sharp","soft","round"]} onChange={(v) => setTweak("radius", v)} />
-          </TweakSection>
-          <TweakSection title="Studio">
-            <TweakRadio label="Canvas tone" value={tweaks.studioCanvasTone} options={[{value:"ivory",label:"Ivory"},{value:"charcoal",label:"Charcoal"}]} onChange={(v) => setTweak("studioCanvasTone", v)} />
-          </TweakSection>
-          <TweakSection title="Quick links">
-            <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:6}}>
-              {[["Home","home"],["Shop","shop"],["Product","product"],["Upload","upload"],["Studio","studio"],["Cart","cart"],["Checkout","checkout"],["Confirmation","confirmation"],["Account","account"],["About","about"],["FAQ","faq"],["Blog","blog"],["Article","article"],["Contact","contact"]].map(([l,p]) => (
-                <button key={p} onClick={() => navigate(p)} style={{padding:"7px 10px", fontSize:11, border:"1px solid var(--line-2)", borderRadius:6, background:page===p?"var(--ink)":"var(--paper)", color:page===p?"var(--paper)":"var(--ink)"}}>{l}</button>
-              ))}
-            </div>
-          </TweakSection>
-        </TweaksPanel>
-    </div>
+        <TweaksPanel title="Tweaks">
+            <TweakSection title="Palette">
+              <TweakColor label="Color palette" value={tweaks.palette} options={PALETTES} onChange={(v) => setTweak("palette", v)} />
+            </TweakSection>
+            <TweakSection title="Typography">
+              <TweakSelect label="Font family" value={tweaks.fontFamily} options={FONT_OPTIONS} onChange={(v) => setTweak("fontFamily", v)} />
+            </TweakSection>
+            <TweakSection title="Layout">
+              <TweakRadio label="Hero variant" value={tweaks.heroVariant} options={[{value:"image",label:"Image-led"},{value:"type",label:"Type-led"}]} onChange={(v) => setTweak("heroVariant", v)} />
+              <TweakRadio label="Product cards" value={tweaks.cardStyle} options={[{value:"tall",label:"Tall"},{value:"wide",label:"Wide"}]} onChange={(v) => setTweak("cardStyle", v)} />
+              <TweakSelect label="Radius scale" value={tweaks.radius} options={["sharp","soft","round"]} onChange={(v) => setTweak("radius", v)} />
+            </TweakSection>
+            <TweakSection title="Studio">
+              <TweakRadio label="Canvas tone" value={tweaks.studioCanvasTone} options={[{value:"ivory",label:"Ivory"},{value:"charcoal",label:"Charcoal"}]} onChange={(v) => setTweak("studioCanvasTone", v)} />
+            </TweakSection>
+            <TweakSection title="Quick links">
+              <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:6}}>
+                {[["Home","home"],["Shop","shop"],["Product","product"],["Upload","upload"],["Studio","studio"],["Cart","cart"],["Checkout","checkout"],["Confirmation","confirmation"],["Account","account"],["About","about"],["FAQ","faq"],["Blog","blog"],["Article","article"],["Contact","contact"]].map(([l,p]) => (
+                  <button key={p} onClick={() => navigate(p)} style={{padding:"7px 10px", fontSize:11, border:"1px solid var(--line-2)", borderRadius:6, background:page===p?"var(--ink)":"var(--paper)", color:page===p?"var(--paper)":"var(--ink)"}}>{l}</button>
+                ))}
+              </div>
+            </TweakSection>
+          </TweaksPanel>
+      </div>
+    </ProductDataContext.Provider>
   );
 }
 
