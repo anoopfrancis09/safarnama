@@ -1,4 +1,5 @@
 import React from "react";
+import { StudioPage, UploadPage } from "./pages/studio/StudioPage.jsx";
 import "./styles.css";
 
 // ===== shared.jsx =====
@@ -152,6 +153,7 @@ const SHOPIFY_CONFIG = {
   storefrontToken: import.meta.env.VITE_SHOPIFY_STOREFRONT_PUBLIC_TOKEN,
   apiVersion: import.meta.env.VITE_SHOPIFY_API_VERSION || "2026-04",
 };
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8787";
 
 const SHOPIFY_PRODUCTS_QUERY = `
   query SafarnamaProducts {
@@ -203,21 +205,6 @@ const SHOPIFY_PRODUCTS_QUERY = `
           key
           value
         }
-      }
-    }
-  }
-`;
-
-const SHOPIFY_CART_CREATE_MUTATION = `
-  mutation CreateSafarnamaCart($input: CartInput!) {
-    cartCreate(input: $input) {
-      cart {
-        id
-        checkoutUrl
-      }
-      userErrors {
-        field
-        message
       }
     }
   }
@@ -415,7 +402,7 @@ function cartItemKey({ slug, size, pages, cover, paper }) {
   return [slug, size, pages, cover, paper].join("::");
 }
 
-function buildCartItem({ product, size, pages, cover, paper, qty }) {
+function buildCartItem({ product, size, pages, cover, paper, qty, albumDesign, project, status }) {
   const variant = findMatchingVariant(product, { size, pages, cover, paper });
   const price = variant?.price || getConfiguredUnitPrice(product, pages, cover);
   const key = cartItemKey({ slug: product.slug, size, pages, cover, paper });
@@ -433,9 +420,10 @@ function buildCartItem({ product, size, pages, cover, paper, qty }) {
     variantId: variant?.id,
     variantTitle: variant?.title,
     qty,
-    status: "Awaiting photos",
+    status: status || (albumDesign?.isComplete ? "Designed" : "Awaiting photos"),
     thumb: product.image,
-    project: "New album",
+    project: project || albumDesign?.projectName || "New album",
+    albumDesign: albumDesign || null,
   };
 }
 
@@ -490,6 +478,9 @@ function createShopifyCartAttributes(item) {
     ["Selected cover", item.details?.cover],
     ["Selected paper", item.details?.paper],
     ["Variant", item.variantTitle],
+    ["Album design", item.albumDesign?.isComplete ? "Complete" : ""],
+    ["Album spreads", item.albumDesign?.spreadCount],
+    ["Album pages", item.albumDesign?.pageCount],
   ]
     .filter(([, value]) => value)
     .map(([key, value]) => ({ key, value: String(value) }));
@@ -500,37 +491,84 @@ async function createShopifyCheckout(items) {
     throw new Error("Your cart is empty.");
   }
 
-  const lines = items.map((item) => {
+  const checkoutItems = items.map((item) => {
     if (!item.variantId) {
       throw new Error(`${item.name} is missing a Shopify variant and cannot be checked out yet.`);
     }
 
     return {
-      merchandiseId: item.variantId,
+      id: item.id,
+      variantId: item.variantId,
+      variantTitle: item.variantTitle,
       quantity: item.qty,
+      name: item.name,
+      slug: item.slug,
+      tier: item.tier,
+      details: item.details,
+      project: item.project,
+      status: item.status,
+      albumDesign: item.albumDesign || null,
       attributes: createShopifyCartAttributes(item),
     };
   });
 
-  const data = await shopifyStorefrontRequest(SHOPIFY_CART_CREATE_MUTATION, {
-    input: {
-      lines,
-      attributes: [
-        { key: "Source", value: "Safarnama React cart" },
-      ],
-    },
+  const response = await fetch(`${API_BASE_URL}/api/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ items: checkoutItems }),
   });
-  const userErrors = data?.cartCreate?.userErrors || [];
-  if (userErrors.length) {
-    throw new Error(userErrors.map((error) => error.message).join("; "));
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(data.error || `Checkout failed with ${response.status}`);
   }
 
-  const checkoutUrl = data?.cartCreate?.cart?.checkoutUrl;
+  if (data.appCartId) {
+    try {
+      window.localStorage.setItem("safarnama:lastAppCartId", data.appCartId);
+    } catch {
+      // Checkout can continue if browser storage is unavailable.
+    }
+  }
+  if (data.appOrderId) {
+    try {
+      window.localStorage.setItem("safarnama:lastAppOrderId", data.appOrderId);
+    } catch {
+      // Checkout can continue if browser storage is unavailable.
+    }
+  }
+
+  const checkoutUrl = data.checkoutUrl;
   if (!checkoutUrl) {
-    throw new Error("Shopify did not return a checkout URL.");
+    throw new Error("The backend did not return a Shopify checkout URL.");
   }
 
   return checkoutUrl;
+}
+
+async function fetchOrderStatus(appOrderId) {
+  const cleanId = appOrderId.trim();
+  if (!cleanId) {
+    throw new Error("Enter your Safarnama order ID.");
+  }
+
+  const response = await fetch(`${API_BASE_URL}/api/order-status?app_order_id=${encodeURIComponent(cleanId)}`);
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(data.error || `Order lookup failed with ${response.status}`);
+  }
+
+  return data;
+}
+
+function formatStatusDate(value) {
+  if (!value) return "Not available yet";
+  return new Intl.DateTimeFormat("en-AU", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  }).format(new Date(value));
 }
 
 const TESTIMONIALS = [
@@ -609,6 +647,7 @@ function TopNav({ active, navigate, cartCount = 0 }) {
             <a className={`nav-link ${active === "about" ? "active" : ""}`} onClick={() => navigate("about")} style={{cursor:"pointer"}}>Our Craft</a>
             <a className={`nav-link ${active === "blog" ? "active" : ""}`} onClick={() => navigate("blog")} style={{cursor:"pointer"}}>Journal</a>
             <a className={`nav-link ${active === "contact" ? "active" : ""}`} onClick={() => navigate("contact")} style={{cursor:"pointer"}}>Contact</a>
+            <a className={`nav-link ${active === "status" ? "active" : ""}`} onClick={() => navigate("status")} style={{cursor:"pointer"}}>Order Status</a>
           </div>
         </div>
         <div className="nav-actions">
@@ -1999,8 +2038,8 @@ function ProductPage({ navigate, params, onAddToCart }) {
                   <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6 }}>or 4 × {formatCurrency(Math.round(total/4), product.currency)} with Afterpay</div>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  <button className="btn btn-primary btn-lg" onClick={() => navigate("upload", { slug: product.slug })}>
-                    Begin uploading photos →
+                  <button className="btn btn-primary btn-lg" onClick={() => navigate("studio", { slug: product.slug })}>
+                    Start designing →
                   </button>
                   <button className="btn btn-ghost btn-sm" onClick={addCurrentSelectionToCart} disabled={adding} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: adding ? 0.78 : 1 }}>
                     {adding && <span className="spinner" aria-hidden="true"></span>}
@@ -2162,624 +2201,9 @@ Object.assign(window, { ShopPage, ProductPage, ProductRow, FilterPopover, Compar
 
 
 // ===== page-studio.jsx =====
-// Photo upload + Design Studio (deep editor)
-function UploadPage({ navigate, params }) {
-  const { products } = useProducts();
-  const product = products.find(p => p.slug === params?.slug) || products[0];
-  const [files, setFiles] = useState([]);
-  const [dragOver, setDragOver] = useState(false);
-  const [uploadingIdx, setUploadingIdx] = useState(-1);
+// Studio upload and editor pages moved to src/pages/studio/StudioPage.jsx
 
-  // Pre-seed a few demo images
-  useEffect(() => {
-    const demo = [
-      { name: "IMG_0124.jpg", size: "8.4 MB", res: "5472 × 3648", quality: "high", src: STOCK.weddingCouple },
-      { name: "IMG_0287.jpg", size: "7.1 MB", res: "5472 × 3648", quality: "high", src: STOCK.weddingFlowers },
-      { name: "IMG_0301.jpg", size: "6.8 MB", res: "5472 × 3648", quality: "high", src: STOCK.weddingHands },
-      { name: "screenshot.png", size: "1.2 MB", res: "1024 × 768", quality: "low", src: STOCK.weddingMandap },
-      { name: "IMG_0412.jpg", size: "9.3 MB", res: "6000 × 4000", quality: "high", src: STOCK.weddingBride },
-      { name: "IMG_0455.jpg", size: "8.7 MB", res: "5472 × 3648", quality: "high", src: STOCK.weddingHenna },
-      { name: "IMG_0498.heic", size: "4.2 MB", res: "4032 × 3024", quality: "medium", src: STOCK.weddingDance },
-      { name: "IMG_0512.jpg", size: "9.1 MB", res: "5472 × 3648", quality: "high", src: STOCK.travelTaj },
-    ];
-    setFiles(demo);
-  }, []);
 
-  const lowQualityCount = files.filter(f => f.quality === "low").length;
-
-  return (
-    <div className="upload-page">
-      <section style={{ padding: "40px 0 100px" }}>
-        <div className="container">
-          <div style={{ display: "flex", gap: 8, alignItems: "center", color: "var(--muted)", fontSize: 12, marginBottom: 24 }}>
-            <a onClick={() => navigate("home")} style={{ cursor: "pointer" }}>Home</a><span>/</span>
-            <a onClick={() => navigate("shop")} style={{ cursor: "pointer" }}>Shop</a><span>/</span>
-            <a onClick={() => navigate("product", { slug: product.slug })} style={{ cursor: "pointer" }}>{product.name}</a><span>/</span>
-            <span>Upload photos</span>
-          </div>
-
-          <Stepper current={1} navigate={navigate} slug={product.slug} />
-
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 360px", gap: 60, marginTop: 60 }}>
-            <div>
-              <span className="eyebrow">Step 02</span>
-              <h1 className="headline" style={{ marginTop: 12, marginBottom: 16, fontSize: "clamp(36px, 4vw, 52px)" }}>Upload your photographs.</h1>
-              <p className="lede" style={{ marginBottom: 32 }}>
-                Pick the photos you'd like in your <strong>{product.name}</strong>. Don't worry about getting it right — you can add, remove and reorder anytime in the Studio.
-              </p>
-
-              {/* Hi-res warning callout */}
-              <div style={{ background: "var(--bg-2)", border: "1px solid var(--line-2)", borderRadius: "var(--r-md)", padding: 20, marginBottom: 28, display: "flex", gap: 16, alignItems: "start" }}>
-                <div style={{ width: 36, height: 36, borderRadius: "50%", background: "var(--accent)", color: "var(--paper)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, fontSize: 18 }}>!</div>
-                <div>
-                  <div style={{ fontSize: 15, fontWeight: 500, marginBottom: 4 }}>High-resolution photos only</div>
-                  <div style={{ fontSize: 13, color: "var(--ink-3)", lineHeight: 1.5 }}>
-                    For print-ready quality, upload original camera files (JPG, PNG, TIFF or HEIC) at <strong>300 DPI minimum</strong>. We recommend the longest edge be at least <strong>3000 pixels</strong>. Avoid screenshots, social media downloads and over-compressed files.
-                  </div>
-                </div>
-              </div>
-
-              {/* Drop zone */}
-              <div
-                onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-                onDragLeave={() => setDragOver(false)}
-                onDrop={(e) => { e.preventDefault(); setDragOver(false); }}
-                style={{
-                  border: `2px dashed ${dragOver ? "var(--accent)" : "var(--line-2)"}`,
-                  background: dragOver ? "rgba(154,107,63,0.06)" : "var(--paper)",
-                  borderRadius: "var(--r-lg)", padding: "48px 24px", textAlign: "center", marginBottom: 28, transition: "all 0.2s"
-                }}
-              >
-                <div style={{ width: 56, height: 56, margin: "0 auto 16px", borderRadius: "50%", background: "var(--bg-2)", display: "flex", alignItems: "center", justifyContent: "center" }}>
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17,8 12,3 7,8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-                </div>
-                <div style={{ fontSize: 16, marginBottom: 8 }}>Drop your photos here</div>
-                <div style={{ fontSize: 13, color: "var(--muted)" }}>or <a style={{ color: "var(--accent-deep)", cursor: "pointer", textDecoration: "underline", textUnderlineOffset: 3 }}>browse from your computer</a></div>
-                <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 16, letterSpacing: 0.04 }}>
-                  JPG · PNG · TIFF · HEIC · up to 50MB per file · stored on encrypted S3
-                </div>
-              </div>
-
-              {/* Files */}
-              {files.length > 0 && (
-                <div>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-                    <div style={{ fontSize: 13 }}>
-                      <strong>{files.length}</strong> photos uploaded
-                      {lowQualityCount > 0 && (
-                        <span style={{ marginLeft: 12, color: "var(--rust)", fontSize: 12 }}>· {lowQualityCount} need attention</span>
-                      )}
-                    </div>
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <button className="btn btn-ghost btn-sm">Sort by date</button>
-                      <button className="btn btn-ghost btn-sm" style={{ color: "var(--rust)" }}>Remove all</button>
-                    </div>
-                  </div>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
-                    {files.map((f, i) => (
-                      <div key={i} style={{ position: "relative", borderRadius: "var(--r-md)", overflow: "hidden", border: f.quality === "low" ? "2px solid var(--rust)" : "1px solid var(--line)" }}>
-                        <div style={{ aspectRatio: "1" }}>
-                          <SmartImage src={f.src} className="img-fill" />
-                        </div>
-                        {f.quality === "low" && (
-                          <div style={{ position: "absolute", top: 8, left: 8, right: 8, padding: "6px 8px", background: "rgba(168,87,48,0.95)", color: "white", borderRadius: 6, fontSize: 10, letterSpacing: 0.04, textAlign: "center" }}>
-                            Low resolution
-                          </div>
-                        )}
-                        <div style={{ position: "absolute", top: 8, right: 8 }}>
-                          <button className="icon-btn" style={{ width: 26, height: 26, background: "rgba(255,255,255,0.9)" }}>
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                          </button>
-                        </div>
-                        <div style={{ padding: "8px 10px", background: "var(--paper)", fontSize: 11, lineHeight: 1.4 }}>
-                          <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
-                          <div style={{ color: "var(--muted)", fontSize: 10 }}>{f.res} · {f.size}</div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Sidebar */}
-            <aside style={{ position: "sticky", top: 120, alignSelf: "start" }}>
-              <div className="card" style={{ padding: 24, marginBottom: 16 }}>
-                <div style={{ display: "flex", gap: 14, marginBottom: 16, paddingBottom: 16, borderBottom: "1px solid var(--line)" }}>
-                  <div style={{ width: 64, height: 64, borderRadius: "var(--r-sm)", overflow: "hidden", flexShrink: 0 }}>
-                    <SmartImage src={product.image} className="img-fill" />
-                  </div>
-                  <div>
-                    <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: 0.06, textTransform: "uppercase" }}>{product.tier}</div>
-                    <div style={{ fontSize: 16, marginTop: 2, marginBottom: 2 }}>{product.name}</div>
-                    <div style={{ fontSize: 12, color: "var(--muted)" }}>12×12 in · 60 pages · Linen</div>
-                  </div>
-                </div>
-                <div style={{ display: "flex", flexDirection: "column", gap: 8, fontSize: 13, marginBottom: 20 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <span style={{ color: "var(--muted)" }}>Recommended photos</span>
-                    <span>40–60</span>
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <span style={{ color: "var(--muted)" }}>Uploaded so far</span>
-                    <span>{files.length}</span>
-                  </div>
-                </div>
-                <button className="btn btn-primary" style={{ width: "100%" }} onClick={() => navigate("studio", { slug: product.slug })}>
-                  Continue to Design Studio →
-                </button>
-                <div style={{ fontSize: 11, color: "var(--muted)", textAlign: "center", marginTop: 12 }}>
-                  Your work is saved automatically.
-                </div>
-              </div>
-
-              <div style={{ padding: 20, fontSize: 13, color: "var(--ink-3)", lineHeight: 1.6 }}>
-                <div style={{ display: "flex", gap: 10, alignItems: "start", marginBottom: 12 }}>
-                  <span style={{ color: "var(--accent)" }}>✦</span>
-                  <span>Don't have time? <a style={{ color: "var(--accent-deep)", cursor: "pointer", textDecoration: "underline", textUnderlineOffset: 3 }}>Let our designers build it</a> — free with every order.</span>
-                </div>
-              </div>
-            </aside>
-          </div>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function Stepper({ current, navigate, slug }) {
-  const steps = [
-    { n: 1, label: "Choose book", page: "product" },
-    { n: 2, label: "Upload photos", page: "upload" },
-    { n: 3, label: "Design Studio", page: "studio" },
-    { n: 4, label: "Review & checkout", page: "checkout" },
-  ];
-  return (
-    <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 20 }}>
-      {steps.map((s, i) => (
-        <React.Fragment key={s.n}>
-          <button onClick={() => navigate(s.page, { slug })} style={{ display: "flex", alignItems: "center", gap: 10, opacity: i <= current ? 1 : 0.45, cursor: "pointer" }}>
-            <span style={{ width: 28, height: 28, borderRadius: "50%", background: i <= current ? "var(--ink)" : "var(--bg-3)", color: i <= current ? "var(--paper)" : "var(--muted)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12 }}>{i < current ? "✓" : s.n}</span>
-            <span style={{ fontSize: 13 }}>{s.label}</span>
-          </button>
-          {i < steps.length - 1 && <span style={{ flex: 1, maxWidth: 40, height: 1, background: "var(--line)" }}></span>}
-        </React.Fragment>
-      ))}
-    </div>
-  );
-}
-
-// ============ DESIGN STUDIO (deep) ============
-function StudioPage({ navigate, params }) {
-  const { products } = useProducts();
-  const product = products.find(p => p.slug === params?.slug) || products[0];
-  const [activeTool, setActiveTool] = useState("layouts");
-  const [activeSpread, setActiveSpread] = useState(2);
-  const [activeLayout, setActiveLayout] = useState("full-bleed");
-  const [aspectFilter, setAspectFilter] = useState("4:3");
-  const [showLayoutDrawer, setShowLayoutDrawer] = useState(true);
-  const [zoom, setZoom] = useState(100);
-  const [projectName, setProjectName] = useState("Anika & Ravi · December 2025");
-  const [savedAt, setSavedAt] = useState("11:42 AM");
-
-  // Photo bin (lots of photos)
-  const photoBin = [
-    STOCK.weddingCouple, STOCK.weddingFlowers, STOCK.weddingHands, STOCK.weddingBride,
-    STOCK.weddingMandap, STOCK.weddingHenna, STOCK.weddingDance, STOCK.travelTaj,
-    STOCK.family, STOCK.craft, STOCK.craftBindery, STOCK.bookOpen,
-  ];
-
-  // Spreads (left/right pages)
-  const [spreads, setSpreads] = useState(() => [
-    { type: "cover", title: "COVER", layout: "cover", photos: [STOCK.weddingCouple] },
-    { type: "title", title: "Title", layout: "title", photos: [STOCK.weddingFlowers], text: "Anika & Ravi" },
-    { type: "spread", title: "Spread 1", layout: "1+1", photos: [STOCK.weddingHands, STOCK.weddingBride] },
-    { type: "spread", title: "Spread 2", layout: "full-bleed", photos: [STOCK.weddingMandap] },
-    { type: "spread", title: "Spread 3", layout: "3+1", photos: [STOCK.weddingHenna, STOCK.weddingFlowers, STOCK.weddingDance, STOCK.travelTaj] },
-    { type: "spread", title: "Spread 4", layout: "1+text", photos: [STOCK.weddingCouple], text: "And so it began." },
-    { type: "spread", title: "Spread 5", layout: "2+2", photos: [STOCK.family, STOCK.craft, STOCK.bookOpen, STOCK.craftBindery] },
-    { type: "back", title: "BACK", layout: "blank", photos: [] },
-  ]);
-
-  return (
-    <div className="studio-app" style={{ background: "var(--ink)", color: "var(--paper)", minHeight: "calc(100vh - 50px)", display: "flex", flexDirection: "column" }}>
-      {/* Top toolbar */}
-      <StudioTopbar projectName={projectName} setProjectName={setProjectName} savedAt={savedAt} navigate={navigate} product={product} />
-
-      <div style={{ flex: 1, display: "grid", gridTemplateColumns: "72px 280px 1fr 320px", overflow: "hidden", minHeight: "calc(100vh - 200px)" }}>
-        {/* Tool rail */}
-        <StudioRail active={activeTool} setActive={setActiveTool} />
-
-        {/* Left panel */}
-        <StudioLeftPanel tool={activeTool} photoBin={photoBin} spreads={spreads} activeSpread={activeSpread} setActiveSpread={setActiveSpread} />
-
-        {/* Canvas */}
-        <StudioCanvas spread={spreads[activeSpread]} zoom={zoom} setZoom={setZoom} canvasTone="ivory" activeIndex={activeSpread} totalSpreads={spreads.length} setActiveSpread={setActiveSpread} />
-
-        {/* Right panel */}
-        <StudioRightPanel layout={activeLayout} setLayout={setActiveLayout} aspectFilter={aspectFilter} setAspectFilter={setAspectFilter} />
-      </div>
-
-      {/* Bottom: page filmstrip */}
-      <StudioFilmstrip spreads={spreads} active={activeSpread} setActive={setActiveSpread} />
-    </div>
-  );
-}
-
-function StudioTopbar({ projectName, setProjectName, savedAt, navigate, product }) {
-  return (
-    <div style={{ borderBottom: "1px solid rgba(255,255,255,0.08)", padding: "14px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "var(--ink)" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-        <button onClick={() => navigate("home")} style={{ height: 18, color: "var(--bg)" }}>
-          <Logo color="var(--bg)" />
-        </button>
-        <span style={{ width: 1, height: 18, background: "rgba(255,255,255,0.15)" }}></span>
-        <input value={projectName} onChange={e => setProjectName(e.target.value)} style={{ background: "transparent", color: "var(--paper)", border: 0, fontFamily: "inherit", fontSize: 14, width: 280, outline: "none", padding: "6px 10px", borderRadius: 6 }} />
-        <span style={{ fontSize: 11, color: "rgba(244,239,230,0.45)" }}>Page 4 of 60</span>
-      </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 18, fontSize: 12, color: "rgba(244,239,230,0.55)" }}>
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-            <span className="dot-pulse" style={{ background: "var(--ok)", width: 6, height: 6 }}></span>
-            Saved · {savedAt}
-          </span>
-        </div>
-        <span style={{ width: 1, height: 18, background: "rgba(255,255,255,0.15)" }}></span>
-        <div style={{ display: "flex", gap: 4 }}>
-          <button className="icon-btn" style={{ color: "rgba(244,239,230,0.7)" }} title="Undo">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
-          </button>
-          <button className="icon-btn" style={{ color: "rgba(244,239,230,0.7)" }} title="Redo">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>
-          </button>
-          <button className="icon-btn" style={{ color: "rgba(244,239,230,0.7)" }} title="History">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-          </button>
-        </div>
-        <span style={{ width: 1, height: 18, background: "rgba(255,255,255,0.15)" }}></span>
-        <button className="btn btn-sm" style={{ color: "var(--paper)", border: "1px solid rgba(255,255,255,0.2)" }}>
-          Preview
-        </button>
-        <button className="btn btn-accent btn-sm" onClick={() => navigate("cart")}>
-          Save & Checkout · ${product.price}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function StudioRail({ active, setActive }) {
-  const tools = [
-    { id: "pages", icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>, label: "Pages" },
-    { id: "photos", icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>, label: "Photos" },
-    { id: "layouts", icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><rect x="3" y="3" width="18" height="18"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="12" y1="3" x2="12" y2="21"/></svg>, label: "Layouts" },
-    { id: "text", icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>, label: "Text" },
-    { id: "background", icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/></svg>, label: "Background" },
-    { id: "settings", icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>, label: "Settings" },
-    { id: "info", icon: <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>, label: "Info" },
-  ];
-  return (
-    <div style={{ background: "var(--ink-2)", borderRight: "1px solid rgba(255,255,255,0.08)", display: "flex", flexDirection: "column", padding: "16px 0", gap: 4 }}>
-      {tools.map(t => (
-        <button key={t.id} onClick={() => setActive(t.id)} title={t.label}
-          style={{
-            margin: "0 12px", padding: "12px 0", borderRadius: 10,
-            background: active === t.id ? "rgba(154,107,63,0.18)" : "transparent",
-            color: active === t.id ? "var(--accent-2)" : "rgba(244,239,230,0.55)",
-            display: "flex", alignItems: "center", justifyContent: "center",
-            transition: "all 0.2s", cursor: "pointer"
-          }}
-        >
-          {t.icon}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function StudioLeftPanel({ tool, photoBin, spreads, activeSpread, setActiveSpread }) {
-  if (tool === "pages") {
-    return (
-      <div style={{ background: "var(--ink-2)", borderRight: "1px solid rgba(255,255,255,0.08)", overflowY: "auto", padding: 18 }}>
-        <div style={{ fontSize: 11, color: "rgba(244,239,230,0.5)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 14 }}>Pages · {spreads.length}</div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-          {spreads.map((s, i) => (
-            <button key={i} onClick={() => setActiveSpread(i)} style={{ padding: 0, borderRadius: 6, overflow: "hidden", border: i === activeSpread ? "2px solid var(--accent)" : "1px solid rgba(255,255,255,0.08)", background: "var(--paper)", aspectRatio: "1.4/1", position: "relative", cursor: "pointer" }}>
-              <MiniSpread spread={s} />
-              <span style={{ position: "absolute", bottom: 2, right: 4, fontSize: 9, color: "var(--muted)", background: "rgba(255,255,255,0.85)", padding: "1px 4px", borderRadius: 3 }}>{i+1}</span>
-            </button>
-          ))}
-        </div>
-        <button className="btn btn-sm" style={{ marginTop: 16, width: "100%", background: "rgba(255,255,255,0.06)", color: "var(--paper)" }}>+ Add spread</button>
-      </div>
-    );
-  }
-  if (tool === "photos") {
-    return (
-      <div style={{ background: "var(--ink-2)", borderRight: "1px solid rgba(255,255,255,0.08)", overflowY: "auto", padding: 18 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-          <div style={{ fontSize: 11, color: "rgba(244,239,230,0.5)", letterSpacing: 0.06, textTransform: "uppercase" }}>Photos · {photoBin.length}</div>
-          <button style={{ fontSize: 11, color: "var(--accent-2)" }}>+ Upload</button>
-        </div>
-        <input className="input" placeholder="Search photos..." style={{ background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "var(--paper)", marginBottom: 12, fontSize: 12, padding: "10px 12px" }} />
-        <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
-          {["All", "Used", "Unused"].map((f, i) => (
-            <button key={f} className="tag" style={{ background: i === 0 ? "rgba(154,107,63,0.2)" : "rgba(255,255,255,0.05)", color: i === 0 ? "var(--accent-2)" : "rgba(244,239,230,0.6)", border: "1px solid rgba(255,255,255,0.08)", fontSize: 10 }}>{f}</button>
-          ))}
-        </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-          {photoBin.map((src, i) => (
-            <div key={i} draggable style={{ aspectRatio: "1", borderRadius: 4, overflow: "hidden", cursor: "grab", position: "relative", border: "1px solid rgba(255,255,255,0.08)" }}>
-              <SmartImage src={src} className="img-fill" />
-              {i % 4 === 0 && <span style={{ position: "absolute", top: 4, right: 4, width: 14, height: 14, borderRadius: "50%", background: "var(--ok)", color: "white", fontSize: 9, display: "flex", alignItems: "center", justifyContent: "center" }}>✓</span>}
-            </div>
-          ))}
-        </div>
-      </div>
-    );
-  }
-  // default = layouts list
-  return (
-    <div style={{ background: "var(--ink-2)", borderRight: "1px solid rgba(255,255,255,0.08)", overflowY: "auto", padding: 18 }}>
-      <div style={{ fontSize: 11, color: "rgba(244,239,230,0.5)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 14 }}>{tool} options</div>
-      <div style={{ fontSize: 13, color: "rgba(244,239,230,0.7)", lineHeight: 1.6 }}>Select an item from the rail to configure it. Tap an element on the canvas to inspect it.</div>
-    </div>
-  );
-}
-
-function StudioCanvas({ spread, zoom, setZoom, canvasTone, activeIndex, totalSpreads, setActiveSpread }) {
-  const bg = canvasTone === "ivory" ? "#F4EFE6" : canvasTone === "charcoal" ? "#3A3530" : "#E5DECC";
-  return (
-    <div style={{ background: "linear-gradient(180deg, #1F1C19 0%, #15120F 100%)", position: "relative", display: "flex", alignItems: "center", justifyContent: "center", padding: 40, overflow: "hidden" }}>
-      {/* Prev/Next */}
-      <button className="icon-btn" onClick={() => setActiveSpread(Math.max(0, activeIndex - 1))} style={{ position: "absolute", left: 16, top: "50%", transform: "translateY(-50%)", color: "rgba(244,239,230,0.45)", width: 44, height: 44, background: "rgba(255,255,255,0.04)" }}>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M15 18l-6-6 6-6"/></svg>
-      </button>
-      <button className="icon-btn" onClick={() => setActiveSpread(Math.min(totalSpreads - 1, activeIndex + 1))} style={{ position: "absolute", right: 16, top: "50%", transform: "translateY(-50%)", color: "rgba(244,239,230,0.45)", width: 44, height: 44, background: "rgba(255,255,255,0.04)" }}>
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M9 18l6-6-6-6"/></svg>
-      </button>
-
-      {/* Spread */}
-      <div style={{ transform: `scale(${zoom/100})`, transformOrigin: "center", transition: "transform 0.2s" }}>
-        <div style={{ display: "flex", boxShadow: "0 30px 80px -10px rgba(0,0,0,0.5)" }}>
-          <div style={{ width: 360, aspectRatio: "1", background: bg, position: "relative", borderRight: "1px solid rgba(0,0,0,0.06)" }}>
-            <SpreadPage spread={spread} side="left" />
-          </div>
-          <div style={{ width: 360, aspectRatio: "1", background: bg, position: "relative" }}>
-            <SpreadPage spread={spread} side="right" />
-          </div>
-        </div>
-      </div>
-
-      {/* Zoom */}
-      <div style={{ position: "absolute", bottom: 20, left: 20, display: "flex", alignItems: "center", gap: 10, background: "rgba(0,0,0,0.4)", padding: "6px 12px", borderRadius: "var(--r-pill)", fontSize: 12, color: "rgba(244,239,230,0.8)" }}>
-        <button onClick={() => setZoom(Math.max(40, zoom - 10))}>−</button>
-        <span style={{ minWidth: 36, textAlign: "center" }}>{zoom}%</span>
-        <button onClick={() => setZoom(Math.min(180, zoom + 10))}>+</button>
-        <span style={{ width: 1, height: 14, background: "rgba(255,255,255,0.15)" }}></span>
-        <button onClick={() => setZoom(100)}>Fit</button>
-      </div>
-
-      <div style={{ position: "absolute", top: 16, right: 16, display: "flex", alignItems: "center", gap: 12, fontSize: 11, color: "rgba(244,239,230,0.5)" }}>
-        <span>{spread.title}</span>
-        <span>·</span>
-        <span>{activeIndex + 1} / {totalSpreads}</span>
-      </div>
-    </div>
-  );
-}
-
-function SpreadPage({ spread, side }) {
-  const photos = spread.photos || [];
-  if (spread.layout === "cover") {
-    return side === "left" ? (
-      <div style={{ width: "100%", height: "100%", background: "#3A1F1A", display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", color: "#E4DBC9", padding: 32 }}>
-        <span style={{ fontSize: 11, letterSpacing: 0.16, textTransform: "uppercase", opacity: 0.7 }}>Safarnama</span>
-        <h2 style={{ fontSize: 36, margin: "12px 0 4px", letterSpacing: "-0.02em", textAlign: "center" }}>Anika & Ravi</h2>
-        <span style={{ fontSize: 12, opacity: 0.7 }}>December 2025</span>
-      </div>
-    ) : <SmartImage src={photos[0]} className="img-fill" />;
-  }
-  if (spread.layout === "title") {
-    return side === "left" ? (
-      <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column", justifyContent: "center", padding: 48 }}>
-        <span style={{ fontSize: 10, letterSpacing: 0.16, textTransform: "uppercase", color: "var(--muted)" }}>Chapter One</span>
-        <h2 style={{ fontSize: 32, margin: "12px 0 8px", letterSpacing: "-0.02em" }}>The Beginning</h2>
-        <p style={{ fontSize: 12, color: "var(--ink-3)", maxWidth: 220 }}>December the twelfth, two thousand and twenty-five.</p>
-      </div>
-    ) : (
-      <div style={{ padding: 36, height: "100%" }}>
-        <div style={{ width: "100%", height: "100%", borderRadius: 4, overflow: "hidden" }}><SmartImage src={photos[0]} className="img-fill" /></div>
-      </div>
-    );
-  }
-  if (spread.layout === "full-bleed") {
-    return side === "left" ? (
-      <div style={{ width: "100%", height: "100%", padding: 36 }}>
-        <div style={{ width: "100%", height: "100%", borderRadius: 4, overflow: "hidden", background: "var(--bg-3)" }}>
-          <SmartImage src={photos[0]} className="img-fill" />
-        </div>
-      </div>
-    ) : <SmartImage src={photos[0]} className="img-fill" />;
-  }
-  if (spread.layout === "1+1") {
-    return (
-      <div style={{ padding: 36, height: "100%" }}>
-        <div style={{ width: "100%", height: "100%", borderRadius: 4, overflow: "hidden" }}>
-          <SmartImage src={side === "left" ? photos[0] : photos[1]} className="img-fill" />
-        </div>
-      </div>
-    );
-  }
-  if (spread.layout === "3+1") {
-    if (side === "right") {
-      return <div style={{ padding: 36, height: "100%" }}><div style={{ width: "100%", height: "100%", borderRadius: 4, overflow: "hidden" }}><SmartImage src={photos[3]} className="img-fill" /></div></div>;
-    }
-    return (
-      <div style={{ padding: 36, height: "100%", display: "grid", gridTemplateColumns: "1fr 1fr", gridTemplateRows: "1fr 1fr", gap: 6 }}>
-        {[0,1,2].map(i => (
-          <div key={i} style={{ borderRadius: 4, overflow: "hidden", gridColumn: i === 0 ? "1 / 3" : "auto" }}>
-            <SmartImage src={photos[i]} className="img-fill" />
-          </div>
-        ))}
-      </div>
-    );
-  }
-  if (spread.layout === "1+text") {
-    return side === "left" ? (
-      <div style={{ padding: 36, height: "100%" }}>
-        <div style={{ width: "100%", height: "100%", borderRadius: 4, overflow: "hidden" }}><SmartImage src={photos[0]} className="img-fill" /></div>
-      </div>
-    ) : (
-      <div style={{ padding: 48, height: "100%", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-        <span style={{ fontSize: 10, letterSpacing: 0.16, textTransform: "uppercase", color: "var(--muted)", marginBottom: 16 }}>02</span>
-        <p style={{ fontSize: 22, lineHeight: 1.4, letterSpacing: "-0.015em", color: "var(--ink-2)", margin: 0 }}>"{spread.text}"</p>
-        <span style={{ fontSize: 10, letterSpacing: 0.06, color: "var(--muted)", marginTop: 20 }}>— A note from the bride</span>
-      </div>
-    );
-  }
-  if (spread.layout === "2+2") {
-    const startIdx = side === "left" ? 0 : 2;
-    return (
-      <div style={{ padding: 36, height: "100%", display: "grid", gridTemplateRows: "1fr 1fr", gap: 6 }}>
-        <div style={{ borderRadius: 4, overflow: "hidden" }}><SmartImage src={photos[startIdx]} className="img-fill" /></div>
-        <div style={{ borderRadius: 4, overflow: "hidden" }}><SmartImage src={photos[startIdx+1]} className="img-fill" /></div>
-      </div>
-    );
-  }
-  // blank
-  return (
-    <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--muted)", fontSize: 11 }}>Drop a photo here</div>
-  );
-}
-
-function MiniSpread({ spread }) {
-  return (
-    <div style={{ display: "flex", height: "100%" }}>
-      <div style={{ flex: 1, position: "relative", borderRight: "0.5px solid rgba(0,0,0,0.05)", background: spread.layout === "cover" ? "#3A1F1A" : "white" }}>
-        {spread.photos[0] && spread.layout !== "cover" && (
-          <div style={{ position: "absolute", inset: 4, overflow: "hidden", borderRadius: 1 }}>
-            <SmartImage src={spread.photos[0]} className="img-fill" />
-          </div>
-        )}
-      </div>
-      <div style={{ flex: 1, position: "relative" }}>
-        {spread.photos[1] && (
-          <div style={{ position: "absolute", inset: 4, overflow: "hidden", borderRadius: 1 }}>
-            <SmartImage src={spread.photos[1]} className="img-fill" />
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function StudioRightPanel({ layout, setLayout, aspectFilter, setAspectFilter }) {
-  const aspects = ["4:3", "3:2", "1:1", "Pano"];
-  const layouts = {
-    "4:3": [
-      { id: "title", name: "Title" },
-      { id: "full-bleed", name: "Full bleed" },
-      { id: "1+1", name: "1 + 1" },
-      { id: "1+text", name: "1 + text" },
-      { id: "2+2", name: "2 + 2" },
-      { id: "3+1", name: "3 + 1" },
-      { id: "grid", name: "Grid 4" },
-      { id: "centered", name: "Centered" },
-    ],
-  };
-  return (
-    <div style={{ background: "var(--ink-2)", borderLeft: "1px solid rgba(255,255,255,0.08)", overflowY: "auto", padding: 18 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-        <div style={{ fontSize: 13, color: "var(--paper)" }}>Layout</div>
-        <select className="select" style={{ width: "auto", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "var(--paper)", fontSize: 12, padding: "6px 10px" }}>
-          <option>All spreads</option>
-          <option>Title spread</option>
-          <option>Photo spread</option>
-        </select>
-      </div>
-
-      <div style={{ display: "flex", gap: 4, marginBottom: 18, padding: 4, background: "rgba(255,255,255,0.04)", borderRadius: 8 }}>
-        {aspects.map(a => (
-          <button key={a} onClick={() => setAspectFilter(a)} style={{ flex: 1, padding: "6px 0", fontSize: 11, borderRadius: 5, background: aspectFilter === a ? "rgba(154,107,63,0.25)" : "transparent", color: aspectFilter === a ? "var(--accent-2)" : "rgba(244,239,230,0.6)" }}>
-            {a}
-          </button>
-        ))}
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-        {(layouts[aspectFilter] || layouts["4:3"]).map(l => (
-          <button key={l.id} onClick={() => setLayout(l.id)} style={{ padding: 0, borderRadius: 6, border: layout === l.id ? "1.5px solid var(--accent)" : "1px solid rgba(255,255,255,0.08)", background: layout === l.id ? "rgba(154,107,63,0.1)" : "rgba(255,255,255,0.03)", overflow: "hidden", cursor: "pointer" }}>
-            <div style={{ aspectRatio: "1.6/1", background: "var(--paper)", padding: 6 }}>
-              <LayoutPreview type={l.id} />
-            </div>
-            <div style={{ fontSize: 10, color: layout === l.id ? "var(--accent-2)" : "rgba(244,239,230,0.55)", padding: "6px 8px", textAlign: "left" }}>{l.name}</div>
-          </button>
-        ))}
-      </div>
-
-      <div style={{ marginTop: 20, paddingTop: 20, borderTop: "1px solid rgba(255,255,255,0.08)" }}>
-        <div style={{ fontSize: 11, color: "rgba(244,239,230,0.5)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 10 }}>Spread settings</div>
-        <SettingRow label="Margin" value="Standard" />
-        <SettingRow label="Spacing" value="6 mm" />
-        <SettingRow label="Caption" value="Below image" />
-        <SettingRow label="Background" value="Ivory" />
-      </div>
-
-      <div style={{ marginTop: 20 }}>
-        <button className="btn btn-sm" style={{ width: "100%", background: "rgba(154,107,63,0.15)", color: "var(--accent-2)" }}>
-          ✨ Auto-fill remaining pages
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function SettingRow({ label, value }) {
-  return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: "1px solid rgba(255,255,255,0.06)", fontSize: 12 }}>
-      <span style={{ color: "rgba(244,239,230,0.55)" }}>{label}</span>
-      <span style={{ color: "var(--paper)" }}>{value}</span>
-    </div>
-  );
-}
-
-function LayoutPreview({ type }) {
-  const cell = { background: "#D9D1C0", borderRadius: 1.5 };
-  const styles = {
-    "title": [{ left: "10%", top: "30%", width: "30%", height: "8%", background: "#999" }, { left: "10%", top: "44%", width: "20%", height: "4%", background: "#bbb" }, { right: "10%", top: "20%", width: "30%", height: "60%" }],
-    "full-bleed": [{ inset: 0 }],
-    "1+1": [{ left: "8%", top: "12%", width: "38%", height: "76%" }, { right: "8%", top: "12%", width: "38%", height: "76%" }],
-    "1+text": [{ left: "8%", top: "12%", width: "38%", height: "76%" }, { right: "8%", top: "30%", width: "30%", height: "4%", background: "#999" }, { right: "8%", top: "40%", width: "26%", height: "3%", background: "#bbb" }, { right: "8%", top: "47%", width: "30%", height: "3%", background: "#bbb" }],
-    "2+2": [{ left: "8%", top: "8%", width: "38%", height: "38%" }, { left: "8%", bottom: "8%", width: "38%", height: "38%" }, { right: "8%", top: "8%", width: "38%", height: "38%" }, { right: "8%", bottom: "8%", width: "38%", height: "38%" }],
-    "3+1": [{ left: "8%", top: "8%", width: "38%", height: "38%" }, { left: "8%", bottom: "8%", width: "18%", height: "38%" }, { left: "29%", bottom: "8%", width: "17%", height: "38%" }, { right: "8%", top: "8%", width: "38%", height: "84%" }],
-    "grid": [{ left: "8%", top: "12%", width: "38%", height: "32%" }, { right: "8%", top: "12%", width: "38%", height: "32%" }, { left: "8%", bottom: "12%", width: "38%", height: "32%" }, { right: "8%", bottom: "12%", width: "38%", height: "32%" }],
-    "centered": [{ left: "20%", top: "20%", width: "60%", height: "60%" }],
-  };
-  const items = styles[type] || styles["full-bleed"];
-  return (
-    <div style={{ position: "relative", width: "100%", height: "100%", background: "#FBF8F2" }}>
-      <div style={{ position: "absolute", left: "50%", top: 0, bottom: 0, width: 1, background: "rgba(0,0,0,0.04)" }}></div>
-      {items.map((s, i) => <div key={i} style={{ position: "absolute", ...cell, ...s }} />)}
-    </div>
-  );
-}
-
-function StudioFilmstrip({ spreads, active, setActive }) {
-  return (
-    <div style={{ background: "var(--ink-2)", borderTop: "1px solid rgba(255,255,255,0.08)", padding: "12px 20px", display: "flex", alignItems: "center", gap: 6, overflowX: "auto", height: 110 }}>
-      {spreads.map((s, i) => (
-        <button key={i} onClick={() => setActive(i)} style={{ flexShrink: 0, height: 76, aspectRatio: "1.4/1", padding: 0, borderRadius: 4, overflow: "hidden", border: i === active ? "2px solid var(--accent)" : "1px solid rgba(255,255,255,0.08)", background: "var(--paper)", cursor: "pointer", position: "relative" }}>
-          <MiniSpread spread={s} />
-          <div style={{ position: "absolute", bottom: 2, left: 4, fontSize: 9, color: "rgba(0,0,0,0.55)", background: "rgba(255,255,255,0.85)", padding: "1px 4px", borderRadius: 3, letterSpacing: 0.04 }}>{i+1}</div>
-        </button>
-      ))}
-      <button style={{ flexShrink: 0, height: 76, aspectRatio: "1.4/1", borderRadius: 4, border: "1px dashed rgba(255,255,255,0.18)", color: "rgba(244,239,230,0.5)", fontSize: 11, background: "transparent", cursor: "pointer" }}>+ Spread</button>
-    </div>
-  );
-}
-
-Object.assign(window, { UploadPage, Stepper, StudioPage, StudioTopbar, StudioRail, StudioLeftPanel, StudioCanvas, StudioRightPanel, StudioFilmstrip, SpreadPage, MiniSpread, LayoutPreview });
 
 
 // ===== page-cart-checkout.jsx =====
@@ -2907,6 +2331,7 @@ function CartPage({ navigate, items, setItems }) {
 
 function CartItem({ item, navigate, setItems, items }) {
   const statusColor = item.status === "Designed" ? "var(--ok)" : item.status === "In studio" ? "var(--accent)" : "var(--muted)";
+  const designSummary = item.albumDesign ? `${item.albumDesign.spreadCount} spreads · ${item.albumDesign.pageCount} pages` : "No saved design";
   return (
     <div className="card" style={{ padding: 24, display: "grid", gridTemplateColumns: "120px 1fr auto", gap: 24 }}>
       <div style={{ aspectRatio: "1", borderRadius: "var(--r-md)", overflow: "hidden" }}>
@@ -2929,9 +2354,10 @@ function CartItem({ item, navigate, setItems, items }) {
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16 }}>
           <span style={{ width: 6, height: 6, borderRadius: "50%", background: statusColor }}></span>
           <span style={{ fontSize: 12, color: statusColor }}>{item.status}</span>
+          <span style={{ fontSize: 12, color: "var(--muted)" }}>· {designSummary}</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button className="btn btn-ghost btn-sm" onClick={() => navigate("studio", { slug: item.slug })}>Edit in Studio</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => navigate("studio", { slug: item.slug, cartItemId: item.id })}>Edit design</button>
           <button className="btn btn-ghost btn-sm" onClick={() => setItems(items.map(i => i.id === item.id ? {...i, qty: i.qty+1} : i))}>Duplicate</button>
           <button className="btn btn-ghost btn-sm" style={{ color: "var(--rust)" }} onClick={() => setItems(items.filter(i => i.id !== item.id))}>Remove</button>
         </div>
@@ -3026,6 +2452,11 @@ function CheckoutPage({ navigate, items = [] }) {
                         <div style={{ fontSize: 14 }}>{b.name}</div>
                         <div style={{ fontSize: 12, color: "var(--muted)", lineHeight: 1.4 }}>{b.config}</div>
                         <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 2 }}>Qty {b.qty}</div>
+                        {b.albumDesign && (
+                          <div style={{ fontSize: 11, color: "var(--accent-deep)", marginTop: 4 }}>
+                            Design JSON saved · {b.albumDesign.spreadCount} spreads · {b.albumDesign.pageCount} pages
+                          </div>
+                        )}
                       </div>
                       <div style={{ fontSize: 14 }}>{formatCurrency(b.price * b.qty, b.currency)}</div>
                     </div>
@@ -3281,6 +2712,157 @@ function ConfirmationPage({ navigate }) {
   );
 }
 
+// ============ ORDER STATUS ============
+function OrderStatusPage({ navigate }) {
+  const [orderId, setOrderId] = useState("");
+  const [lookup, setLookup] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const result = lookup?.order || lookup?.checkout || null;
+  const paidOrder = lookup?.order;
+  const checkout = lookup?.checkout;
+  const statusLabel = paidOrder ? "Order received" : checkout ? "Checkout started" : "Not found";
+
+  const search = async (event) => {
+    event?.preventDefault();
+    setLoading(true);
+    setError("");
+    setLookup(null);
+
+    try {
+      const data = await fetchOrderStatus(orderId);
+      setLookup(data);
+    } catch (err) {
+      setError(err.message || "Unable to look up that order.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="order-status-page">
+      <section style={{ padding: "60px 0 100px" }}>
+        <div className="container-narrow">
+          <div style={{ marginBottom: 40 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", color: "var(--muted)", fontSize: 12, marginBottom: 24 }}>
+              <a onClick={() => navigate("home")} style={{ cursor: "pointer" }}>Home</a>
+              <span>/</span>
+              <span>Order status</span>
+            </div>
+            <span className="eyebrow">Order status</span>
+            <h1 className="headline" style={{ marginTop: 12, marginBottom: 16 }}>Track your Safarnama order.</h1>
+            <p className="lede" style={{ maxWidth: 680 }}>
+              Enter the order ID that begins with <strong>sf-</strong>. You'll find it after checkout starts, and it is also saved with your Shopify order details.
+            </p>
+          </div>
+
+          <form className="card" onSubmit={search} style={{ padding: 28, marginBottom: 24 }}>
+            <Field label="Safarnama order ID">
+              <div style={{ display: "flex", gap: 10 }}>
+                <input
+                  className="input"
+                  value={orderId}
+                  onChange={(event) => setOrderId(event.target.value)}
+                  placeholder="Enter your order id..."
+                  style={{ flex: 1, fontFeatureSettings: '"tnum"' }}
+                />
+                <button className="btn btn-primary" type="submit" disabled={loading} style={{ minWidth: 150, display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+                  {loading && <span className="spinner" aria-hidden="true"></span>}
+                  {loading ? "Checking..." : "Check status"}
+                </button>
+              </div>
+            </Field>
+            {error && (
+              <div className="fade-in" style={{ marginTop: 14, padding: "10px 12px", borderRadius: "var(--r-sm)", border: "1px solid rgba(168,87,48,0.25)", background: "rgba(168,87,48,0.08)", color: "var(--rust)", fontSize: 12, lineHeight: 1.45 }}>
+                {error}
+              </div>
+            )}
+          </form>
+
+          {lookup && !lookup.found && (
+            <div className="card fade-in" style={{ padding: 48, minHeight: 320, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center" }}>
+              <div style={{ width: 72, height: 72, borderRadius: "50%", background: "var(--bg-2)", display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 20 }}>
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+              </div>
+              <h2 style={{ fontSize: 28, letterSpacing: "-0.02em", margin: "0 0 10px" }}>No order found.</h2>
+              <p style={{ fontSize: 14, color: "var(--ink-3)", maxWidth: 440, lineHeight: 1.6, margin: 0 }}>
+                We couldn't find anything for <strong style={{ color: "var(--ink)" }}>{lookup.appOrderId}</strong>. Check the ID and try again, or contact us if your payment has already gone through.
+              </p>
+            </div>
+          )}
+
+          {lookup?.found && (
+            <div className="card fade-in" style={{ padding: 28, background: "linear-gradient(180deg, var(--paper) 0%, var(--bg-2) 100%)" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "start", gap: 24, marginBottom: 24 }}>
+                <div>
+                  <span className={`tag ${paidOrder ? "accent" : ""}`}>{statusLabel}</span>
+                  <h2 style={{ fontSize: 28, letterSpacing: "-0.02em", margin: "12px 0 4px" }}>{lookup.appOrderId}</h2>
+                  <div style={{ fontSize: 13, color: "var(--ink-3)" }}>
+                    {paidOrder?.orderName ? `${paidOrder.orderName} · ` : ""}{paidOrder ? "Shopify order confirmed" : "Waiting for Shopify purchase confirmation"}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 12, color: "var(--muted)" }}>{paidOrder ? "Placed" : "Checkout created"}</div>
+                  <div style={{ fontSize: 18, letterSpacing: "-0.01em", marginTop: 4 }}>{formatStatusDate(paidOrder?.createdAt || checkout?.createdAt)}</div>
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 24, padding: "20px 0", borderTop: "1px solid var(--line)", borderBottom: "1px solid var(--line)" }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 0, position: "relative" }}>
+                  <div style={{ position: "absolute", top: 18, left: "12%", right: "12%", height: 2, background: "var(--line-2)", zIndex: 0 }}></div>
+                  <div style={{ position: "absolute", top: 18, left: "12%", width: paidOrder ? "50%" : "14%", height: 2, background: "var(--accent)", zIndex: 1 }}></div>
+                  {["Checkout", "Paid", "Review", "Production"].map((step, i) => {
+                    const activeIndex = paidOrder ? 1 : 0;
+                    const active = i <= activeIndex;
+                    return (
+                      <div key={step} style={{ position: "relative", zIndex: 2, display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+                        <span style={{ width: active ? 14 : 10, height: active ? 14 : 10, borderRadius: "50%", background: active ? "var(--accent)" : "var(--paper)", border: active ? "none" : "2px solid var(--line-2)", marginTop: active ? 12 : 14 }}></span>
+                        <span style={{ fontSize: 11, color: active ? "var(--ink)" : "var(--muted)", textAlign: "center" }}>{step}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 24 }}>
+                <StatusMeta label="Status" value={paidOrder?.financialStatus || checkout?.status || "checkout_created"} />
+                <StatusMeta label="Total" value={paidOrder?.totalPrice ? `${paidOrder.currency || "AUD"} ${paidOrder.totalPrice}` : "Available after purchase"} />
+                <StatusMeta label="Shopify order" value={paidOrder?.orderName || "Not created yet"} />
+                <StatusMeta label="Email" value={paidOrder?.email || "Available after purchase"} />
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                {(paidOrder?.lineItems || checkout?.items || []).map((item, index) => (
+                  <div key={item.id || index} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 20, alignItems: "start", padding: 16, border: "1px solid var(--line)", borderRadius: "var(--r-sm)", background: "var(--paper)" }}>
+                    <div>
+                      <div style={{ fontSize: 15, marginBottom: 4 }}>{item.title || item.name}</div>
+                      <div style={{ fontSize: 12, color: "var(--ink-3)", lineHeight: 1.5 }}>
+                        {item.variantTitle || item.variant_title || "Selected book"}
+                        {item.details && ` · ${[item.details.size, item.details.pages ? `${item.details.pages} pages` : "", item.details.cover, item.details.paper].filter(Boolean).join(" · ")}`}
+                      </div>
+                    </div>
+                    <span className="tag">Qty {item.quantity || item.qty || 1}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function StatusMeta({ label, value }) {
+  return (
+    <div style={{ padding: 16, borderRadius: "var(--r-sm)", background: "var(--paper)", border: "1px solid var(--line)" }}>
+      <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 15, color: "var(--ink)", overflowWrap: "anywhere" }}>{value || "Not available"}</div>
+    </div>
+  );
+}
+
 // ============ ACCOUNT ============
 function AccountPage({ navigate }) {
   const [tab, setTab] = useState("orders");
@@ -3437,7 +3019,7 @@ function AccountPlaceholder({ tab }) {
   );
 }
 
-Object.assign(window, { CartPage, CheckoutPage, ConfirmationPage, AccountPage });
+Object.assign(window, { CartPage, CheckoutPage, ConfirmationPage, OrderStatusPage, AccountPage });
 
 
 // ===== page-misc.jsx =====
@@ -3889,6 +3471,45 @@ function App() {
     });
   }, []);
 
+  const saveAlbumDesignToCart = React.useCallback((albumDesign, product) => {
+    if (!product || !albumDesign) return;
+    setCartItems((current) => {
+      const existingByRoute = albumDesign.cartItemId ? current.find((item) => item.id === albumDesign.cartItemId) : null;
+      const size = existingByRoute?.details?.size || product.sizes?.[0] || "";
+      const pages = existingByRoute?.details?.pages || product.pages?.[1] || product.pages?.[0] || albumDesign.pageCount || 0;
+      const cover = existingByRoute?.details?.cover || product.cover?.[0] || "";
+      const paper = existingByRoute?.details?.paper || product.paper?.[0] || "";
+      const qty = existingByRoute?.qty || 1;
+      const draftItem = buildCartItem({
+        product,
+        size,
+        pages,
+        cover,
+        paper,
+        qty,
+        albumDesign,
+        project: albumDesign.projectName,
+        status: "Designed",
+      });
+      const existing = existingByRoute || current.find((item) => item.id === draftItem.id);
+      const savedDesign = { ...albumDesign, cartItemId: existing?.id || draftItem.id };
+      const savedItem = {
+        ...(existing || draftItem),
+        ...draftItem,
+        id: existing?.id || draftItem.id,
+        qty: existing?.qty || draftItem.qty,
+        status: "Designed",
+        project: savedDesign.projectName,
+        albumDesign: savedDesign,
+      };
+
+      if (existing) {
+        return current.map((item) => item.id === existing.id ? savedItem : item);
+      }
+      return [...current, savedItem];
+    });
+  }, []);
+
   React.useEffect(() => {
     // hash router
     const onHash = () => {
@@ -3947,16 +3568,18 @@ function App() {
   }, [tweaks]);
 
   const showShell = page !== "studio" && page !== "checkout";
+  const activeStudioCartItem = params?.cartItemId ? cartItems.find((item) => item.id === params.cartItemId) : null;
 
   let content;
   if (page === "home") content = <HomePage navigate={navigate} tweaks={tweaks} />;
   else if (page === "shop") content = <ShopPage navigate={navigate} tweaks={tweaks} />;
   else if (page === "product") content = <ProductPage navigate={navigate} params={params} onAddToCart={addToCart} />;
-  else if (page === "upload") content = <UploadPage navigate={navigate} params={params} />;
-  else if (page === "studio") content = <StudioPage navigate={navigate} params={params} />;
+  else if (page === "upload") content = <UploadPage navigate={navigate} params={params} products={productData.products} stock={STOCK} SmartImage={SmartImage} />;
+  else if (page === "studio") content = <StudioPage navigate={navigate} params={params} products={productData.products} SmartImage={SmartImage} Logo={Logo} initialAlbumDesign={activeStudioCartItem?.albumDesign || null} onSaveAlbumDesign={saveAlbumDesignToCart} />;
   else if (page === "cart") content = <CartPage navigate={navigate} items={cartItems} setItems={setCartItems} />;
   else if (page === "checkout") content = <CheckoutPage navigate={navigate} items={cartItems} />;
   else if (page === "confirmation") content = <ConfirmationPage navigate={navigate} />;
+  else if (page === "status") content = <OrderStatusPage navigate={navigate} />;
   else if (page === "account") content = <AccountPage navigate={navigate} />;
   else if (page === "about") content = <AboutPage navigate={navigate} />;
   else if (page === "faq") content = <FaqPage />;
@@ -3989,7 +3612,7 @@ function App() {
             </TweakSection>
             <TweakSection title="Quick links">
               <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:6}}>
-                {[["Home","home"],["Shop","shop"],["Product","product"],["Upload","upload"],["Studio","studio"],["Cart","cart"],["Checkout","checkout"],["Confirmation","confirmation"],["Account","account"],["About","about"],["FAQ","faq"],["Blog","blog"],["Article","article"],["Contact","contact"]].map(([l,p]) => (
+                {[["Home","home"],["Shop","shop"],["Product","product"],["Upload","upload"],["Studio","studio"],["Cart","cart"],["Checkout","checkout"],["Confirmation","confirmation"],["Status","status"],["Account","account"],["About","about"],["FAQ","faq"],["Blog","blog"],["Article","article"],["Contact","contact"]].map(([l,p]) => (
                   <button key={p} onClick={() => navigate(p)} style={{padding:"7px 10px", fontSize:11, border:"1px solid var(--line-2)", borderRadius:6, background:page===p?"var(--ink)":"var(--paper)", color:page===p?"var(--paper)":"var(--ink)"}}>{l}</button>
                 ))}
               </div>
@@ -4001,7 +3624,7 @@ function App() {
 }
 
 function pageLabel(p) {
-  return ({home:"Home",shop:"Shop",product:"Product",upload:"Upload",studio:"Studio",cart:"Cart",checkout:"Checkout",confirmation:"Confirmation",account:"Account",about:"About",faq:"FAQ",blog:"Blog",article:"Article",contact:"Contact"})[p] || p;
+  return ({home:"Home",shop:"Shop",product:"Product",upload:"Upload",studio:"Studio",cart:"Cart",checkout:"Checkout",confirmation:"Confirmation",status:"Order Status",account:"Account",about:"About",faq:"FAQ",blog:"Blog",article:"Article",contact:"Contact"})[p] || p;
 }
 
 // Color helpers
