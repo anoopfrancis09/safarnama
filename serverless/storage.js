@@ -21,7 +21,7 @@ function absoluteStorageUrl(value) {
   return `${storageBaseUrl()}${value.startsWith("/") ? value : `/${value}`}`;
 }
 
-async function storageRequest(endpoint, { method = "GET", body } = {}) {
+async function storageRequest(endpoint, { method = "GET", body, headers = {} } = {}) {
   requireSupabaseConfig();
 
   const response = await fetch(`${storageBaseUrl()}${endpoint}`, {
@@ -30,6 +30,7 @@ async function storageRequest(endpoint, { method = "GET", body } = {}) {
       apikey: config.supabase.serviceRoleKey,
       Authorization: `Bearer ${config.supabase.serviceRoleKey}`,
       "Content-Type": "application/json",
+      ...headers,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -49,7 +50,8 @@ export async function createSignedUploadUrl({ bucket = DEFAULT_BUCKET, path, ups
   const encodedPath = encodeStoragePath(path);
   const payload = await storageRequest(`/object/upload/sign/${encodeURIComponent(bucket)}/${encodedPath}`, {
     method: "POST",
-    body: { upsert },
+    body: {},
+    headers: upsert ? { "x-upsert": "true" } : {},
   });
 
   const signedValue = payload?.signedURL || payload?.signedUrl || payload?.url || payload?.signed_url;
@@ -61,6 +63,35 @@ export async function createSignedUploadUrl({ bucket = DEFAULT_BUCKET, path, ups
     path,
     token,
     uploadUrl: absoluteStorageUrl(signedValue || fallback),
+  };
+}
+
+export async function uploadObject({ bucket = DEFAULT_BUCKET, path, bytes, contentType = "application/octet-stream", upsert = true }) {
+  requireSupabaseConfig();
+  const encodedPath = encodeStoragePath(path);
+  const response = await fetch(`${storageBaseUrl()}/object/${encodeURIComponent(bucket)}/${encodedPath}`, {
+    method: "POST",
+    headers: {
+      apikey: config.supabase.serviceRoleKey,
+      Authorization: `Bearer ${config.supabase.serviceRoleKey}`,
+      "Content-Type": contentType,
+      "x-upsert": String(Boolean(upsert)),
+    },
+    body: bytes,
+  });
+
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : null;
+
+  if (!response.ok) {
+    const message = payload?.message || payload?.error || text || `Supabase Storage upload failed with ${response.status}`;
+    throw new Error(message);
+  }
+
+  return {
+    bucket,
+    path,
+    payload,
   };
 }
 
@@ -77,4 +108,3 @@ export async function createSignedReadUrl({ bucket = DEFAULT_BUCKET, path, expir
     signedUrl: absoluteStorageUrl(payload?.signedURL || payload?.signedUrl || payload?.url || payload?.signed_url),
   };
 }
-

@@ -110,6 +110,150 @@ function downloadJson(data, fileName) {
   URL.revokeObjectURL(url);
 }
 
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+    }
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let value = 0xffffffff;
+  for (let index = 0; index < bytes.length; index += 1) {
+    value = CRC32_TABLE[(value ^ bytes[index]) & 0xff] ^ (value >>> 8);
+  }
+  return (value ^ 0xffffffff) >>> 0;
+}
+
+function writeUint16(output, value) {
+  output.push(value & 0xff, (value >>> 8) & 0xff);
+}
+
+function writeUint32(output, value) {
+  output.push(value & 0xff, (value >>> 8) & 0xff, (value >>> 16) & 0xff, (value >>> 24) & 0xff);
+}
+
+function dosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  return {
+    time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+    date: ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate(),
+  };
+}
+
+function makeUniqueZipName(asset, usedNames) {
+  const fallback = asset.storagePath?.split("/").pop() || "album-photo";
+  const baseName = cleanFileName(asset.fileName || fallback, "album-photo");
+  const dotIndex = baseName.lastIndexOf(".");
+  const name = dotIndex > 0 ? baseName.slice(0, dotIndex) : baseName;
+  const extension = dotIndex > 0 ? baseName.slice(dotIndex) : "";
+  let candidate = baseName;
+  let counter = 2;
+  while (usedNames.has(candidate)) {
+    candidate = `${name}-${counter}${extension}`;
+    counter += 1;
+  }
+  usedNames.add(candidate);
+  return candidate;
+}
+
+function createZipBlob(files) {
+  const encoder = new TextEncoder();
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  const stamp = dosDateTime();
+
+  files.forEach((file) => {
+    const nameBytes = encoder.encode(file.name);
+    const data = file.bytes;
+    const checksum = crc32(data);
+    const local = [];
+
+    writeUint32(local, 0x04034b50);
+    writeUint16(local, 20);
+    writeUint16(local, 0x0800);
+    writeUint16(local, 0);
+    writeUint16(local, stamp.time);
+    writeUint16(local, stamp.date);
+    writeUint32(local, checksum);
+    writeUint32(local, data.length);
+    writeUint32(local, data.length);
+    writeUint16(local, nameBytes.length);
+    writeUint16(local, 0);
+
+    localParts.push(new Uint8Array(local), nameBytes, data);
+
+    const central = [];
+    writeUint32(central, 0x02014b50);
+    writeUint16(central, 20);
+    writeUint16(central, 20);
+    writeUint16(central, 0x0800);
+    writeUint16(central, 0);
+    writeUint16(central, stamp.time);
+    writeUint16(central, stamp.date);
+    writeUint32(central, checksum);
+    writeUint32(central, data.length);
+    writeUint32(central, data.length);
+    writeUint16(central, nameBytes.length);
+    writeUint16(central, 0);
+    writeUint16(central, 0);
+    writeUint16(central, 0);
+    writeUint16(central, 0);
+    writeUint32(central, 0);
+    writeUint32(central, offset);
+
+    centralParts.push(new Uint8Array(central), nameBytes);
+    offset += local.length + nameBytes.length + data.length;
+  });
+
+  const centralOffset = offset;
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const end = [];
+  writeUint32(end, 0x06054b50);
+  writeUint16(end, 0);
+  writeUint16(end, 0);
+  writeUint16(end, files.length);
+  writeUint16(end, files.length);
+  writeUint32(end, centralSize);
+  writeUint32(end, centralOffset);
+  writeUint16(end, 0);
+
+  return new Blob([...localParts, ...centralParts, new Uint8Array(end)], { type: "application/zip" });
+}
+
+async function downloadAssetsZip(assets, fileName) {
+  const usedNames = new Set();
+  const files = [];
+
+  for (const asset of assets) {
+    const signedUrl = await getSignedAssetUrl(asset);
+    const response = await fetch(signedUrl);
+    if (!response.ok) throw new Error(`Could not download ${asset.fileName || asset.storagePath}`);
+    files.push({
+      name: makeUniqueZipName(asset, usedNames),
+      bytes: new Uint8Array(await response.arrayBuffer()),
+    });
+  }
+
+  if (!files.length) throw new Error("No album assets are available to zip.");
+
+  const blob = createZipBlob(files);
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 async function downloadAsset(asset) {
   const signedUrl = await getSignedAssetUrl(asset);
   const response = await fetch(signedUrl);
@@ -184,8 +328,15 @@ export function AdminPage() {
     setBusyAction(actionId);
     setError("");
     try {
-      const refreshed = await refreshDesignImageUrls(design);
-      await downloadStudioPdf(refreshed.spreads || [], refreshed.projectName || checkout.appOrderId || "safarnama-album");
+      if (design.designPdf?.storagePath) {
+        await downloadAsset({
+          ...design.designPdf,
+          fileName: design.designPdf.fileName || `${cleanFileName(design.projectName || checkout.appOrderId || "album-design", "album-design")}.pdf`,
+        });
+      } else {
+        const refreshed = await refreshDesignImageUrls(design);
+        await downloadStudioPdf(refreshed.spreads || [], refreshed.projectName || checkout.appOrderId || "safarnama-album");
+      }
     } catch (err) {
       setError(err.message || "Could not create album PDF.");
     } finally {
@@ -199,23 +350,10 @@ export function AdminPage() {
     setBusyAction(actionId);
     setError("");
     try {
-      for (const asset of designAssets) {
-        await downloadAsset(asset);
-      }
+      const zipName = `${cleanFileName(design.projectName || checkout.appOrderId || "album-assets", "album-assets")}-assets.zip`;
+      await downloadAssetsZip(designAssets, zipName);
     } catch (err) {
       setError(err.message || "Could not download album assets.");
-    } finally {
-      setBusyAction("");
-    }
-  };
-
-  const handleDownloadAsset = async (asset) => {
-    setBusyAction(`asset-${asset.storagePath}`);
-    setError("");
-    try {
-      await downloadAsset(asset);
-    } catch (err) {
-      setError(err.message || "Could not download asset.");
     } finally {
       setBusyAction("");
     }
@@ -267,7 +405,6 @@ export function AdminPage() {
                   busyAction={busyAction}
                   onDownloadPdf={handleDownloadPdf}
                   onDownloadAssets={handleDownloadAllAssets}
-                  onDownloadAsset={handleDownloadAsset}
                 />
               ))}
             </div>
@@ -287,7 +424,7 @@ function AdminStat({ label, value }) {
   );
 }
 
-function AdminCheckoutCard({ checkout, busyAction, onDownloadPdf, onDownloadAssets, onDownloadAsset }) {
+function AdminCheckoutCard({ checkout, busyAction, onDownloadPdf, onDownloadAssets }) {
   const designs = getCheckoutDesigns(checkout);
   const itemCount = (checkout.items || []).reduce((total, item) => total + Number(item.quantity || item.qty || 1), 0);
 
@@ -333,7 +470,7 @@ function AdminCheckoutCard({ checkout, busyAction, onDownloadPdf, onDownloadAsse
                     {busyAction === `pdf-${actionKey}` ? "Creating PDF..." : "Download PDF"}
                   </button>
                   <button className="btn btn-ghost btn-sm" onClick={() => onDownloadAssets(checkout, design)} disabled={!designAssets.length || busyAction === `assets-${actionKey}`}>
-                    {busyAction === `assets-${actionKey}` ? "Downloading..." : "Download assets"}
+                    {busyAction === `assets-${actionKey}` ? "Creating ZIP..." : "Download ZIP"}
                   </button>
                   <button className="btn btn-ghost btn-sm" onClick={() => downloadJson(design, `${cleanFileName(design.projectName || checkout.appOrderId, "album-design")}.json`)}>
                     Design JSON
@@ -341,20 +478,6 @@ function AdminCheckoutCard({ checkout, busyAction, onDownloadPdf, onDownloadAsse
                 </div>
               </div>
 
-              {designAssets.length > 0 && (
-                <div style={{ marginTop: 14, display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 8 }}>
-                  {designAssets.slice(0, 8).map((asset) => (
-                    <button key={asset.storagePath} onClick={() => onDownloadAsset(asset)} disabled={busyAction === `asset-${asset.storagePath}`} style={{ padding: "9px 10px", border: "1px solid var(--line)", borderRadius: 8, background: "var(--bg-2)", color: "var(--ink)", fontSize: 12, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", opacity: busyAction === `asset-${asset.storagePath}` ? 0.55 : 1 }} title={asset.storagePath}>
-                      {busyAction === `asset-${asset.storagePath}` ? "Downloading..." : (asset.fileName || asset.storagePath)}
-                    </button>
-                  ))}
-                  {designAssets.length > 8 && (
-                    <div style={{ padding: "9px 10px", color: "var(--muted)", fontSize: 12 }}>
-                      +{designAssets.length - 8} more in bulk download
-                    </div>
-                  )}
-                </div>
-              )}
             </div>
           );
         })}

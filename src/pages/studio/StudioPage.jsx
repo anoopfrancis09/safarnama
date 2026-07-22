@@ -268,6 +268,47 @@ function studioApiUrl(path) {
   return `${STUDIO_API_BASE_URL}${path}`;
 }
 
+async function uploadToSignedStorageUrl(uploadUrl, fileBody, { fileName, contentType = "application/octet-stream", cacheControl = "3600" } = {}) {
+  const headers = { "x-upsert": "true" };
+  let body = fileBody;
+
+  if (typeof FormData !== "undefined" && typeof Blob !== "undefined" && fileBody instanceof Blob) {
+    body = new FormData();
+    body.append("cacheControl", cacheControl);
+    body.append("", fileBody, fileName || "upload");
+  } else {
+    headers["Content-Type"] = contentType;
+    headers["cache-control"] = `max-age=${cacheControl}`;
+  }
+
+  return fetch(uploadUrl, {
+    method: "PUT",
+    headers,
+    body,
+  });
+}
+
+function cleanStorageName(value, fallback = "album") {
+  return String(value || fallback)
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .toLowerCase() || fallback;
+}
+
+function storageTimestamp(date = new Date()) {
+  return date.toISOString().replace(/\.\d{3}Z$/, "Z").replace(/[:.]/g, "-");
+}
+
+function createAlbumStorageFolder(projectName) {
+  return `albums/${cleanStorageName(projectName || "album-design", "album")}-${storageTimestamp()}`;
+}
+
+function buildAlbumStoragePath(albumFolder, section, fileName) {
+  const id = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `${albumFolder}/${section}/${id}-${cleanStorageName(fileName || "asset", "asset")}`;
+}
+
 function photoPatch(photoOrSrc) {
   if (typeof photoOrSrc === "string") return { src: photoOrSrc };
   if (!photoOrSrc) return { src: "" };
@@ -433,14 +474,19 @@ async function getImageSize(src) {
   });
 }
 
-async function convertImageToPdfJpeg(src) {
+async function convertImageToPdfJpeg(src, options = {}) {
+  const maxDimension = options.maxDimension || 2400;
+  const quality = options.quality ?? 0.88;
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.onload = () => {
       try {
-        const width = img.naturalWidth || 1200;
-        const height = img.naturalHeight || 800;
+        const naturalWidth = img.naturalWidth || 1200;
+        const naturalHeight = img.naturalHeight || 800;
+        const scale = Math.min(1, maxDimension / Math.max(naturalWidth, naturalHeight));
+        const width = Math.max(1, Math.round(naturalWidth * scale));
+        const height = Math.max(1, Math.round(naturalHeight * scale));
         const canvas = document.createElement("canvas");
         canvas.width = width;
         canvas.height = height;
@@ -454,7 +500,7 @@ async function convertImageToPdfJpeg(src) {
             return;
           }
           resolve({ width, height, bytes: new Uint8Array(await blob.arrayBuffer()) });
-        }, "image/jpeg", 0.92);
+        }, "image/jpeg", quality);
       } catch (error) {
         reject(error);
       }
@@ -464,12 +510,13 @@ async function convertImageToPdfJpeg(src) {
   });
 }
 
-async function loadPdfImage(src) {
+async function loadPdfImage(src, options = {}) {
   try {
-    return await convertImageToPdfJpeg(src);
+    return await convertImageToPdfJpeg(src, options);
   } catch {
     // Some remote images disallow canvas reads; direct JPEG embedding still works when fetch is permitted.
   }
+  if (options.allowOriginalFallback === false) return null;
   try {
     const [response, size] = await Promise.all([fetch(src, { mode: "cors" }), getImageSize(src)]);
     const blob = await response.blob();
@@ -518,11 +565,12 @@ function drawPdfTextBlock(item, pageWidth, pageHeight) {
   return content;
 }
 
-export async function downloadStudioPdf(spreads, projectName) {
+export async function createStudioPdfBlob(spreads, options = {}) {
   const uniqueSources = [...new Set(spreads.flatMap((spread) => (spread.items || []).map((item) => item.src).filter(Boolean)))];
+  const imageOptions = options.image || {};
   const loadedImages = new Map();
   await Promise.all(uniqueSources.map(async (src, index) => {
-    const image = await loadPdfImage(src);
+    const image = await loadPdfImage(src, imageOptions);
     if (image) loadedImages.set(src, { ...image, name: `Im${index}` });
   }));
 
@@ -615,7 +663,11 @@ export async function downloadStudioPdf(spreads, projectName) {
   xref += `trailer\n<< /Size ${objects.length + 1} /Root ${catalogId} 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
   parts.push(encoder.encode(xref));
 
-  const blob = new Blob(parts, { type: "application/pdf" });
+  return new Blob(parts, { type: "application/pdf" });
+}
+
+export async function downloadStudioPdf(spreads, projectName) {
+  const blob = await createStudioPdfBlob(spreads);
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -637,14 +689,24 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
   const [selectedItemIdsBySpread, setSelectedItemIdsBySpread] = useState({});
   const [selectedTextIdsBySpread, setSelectedTextIdsBySpread] = useState({});
   const [exportingPdf, setExportingPdf] = useState(false);
+  const [savingDesign, setSavingDesign] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const [previewOpen, setPreviewOpen] = useState(false);
   const uploadInputRef = useRef(null);
+  const albumFolderRef = useRef(initialAlbumDesign?.albumFolder || initialAlbumDesign?.storageFolder || "");
   const historyRef = useRef([]);
   const clipboardRef = useRef(null);
   const [photoBin, setPhotoBin] = useState(() => initialAlbumDesign?.photoLibrary || photoLibraryFromDesign(initialAlbumDesign?.spreads || []));
 
   // Spreads (left/right pages)
   const [spreads, setSpreads] = useState(() => initialAlbumDesign?.spreads?.length ? initialAlbumDesign.spreads.map(normalizeStudioSpread) : defaultStudioSpreads());
+
+  const getAlbumFolder = () => {
+    if (!albumFolderRef.current) {
+      albumFolderRef.current = createAlbumStorageFolder(projectName);
+    }
+    return albumFolderRef.current;
+  };
 
   const activeSpreadData = spreads[activeSpread];
   const activeLayout = activeSpreadData?.layout || "full-bleed";
@@ -936,6 +998,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
   const handleUploadLibrary = async (event) => {
     const files = [...event.target.files];
     if (!files.length) return;
+    const targetAlbumFolder = getAlbumFolder();
     const pendingPhotos = files.map((file, index) => ({
       id: `upload-${Date.now()}-${index}`,
       name: file.name,
@@ -958,6 +1021,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
             fileName: file.name,
             contentType: file.type || "application/octet-stream",
             size: file.size,
+            path: buildAlbumStoragePath(targetAlbumFolder, "photos", file.name),
           }),
         });
         const signData = await signResponse.json().catch(() => ({}));
@@ -968,13 +1032,13 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
           throw new Error("The upload endpoint did not return a signed URL.");
         }
 
-        const uploadResponse = await fetch(signData.uploadUrl, {
-          method: "PUT",
-          headers: { "Content-Type": file.type || "application/octet-stream" },
-          body: file,
+        const uploadResponse = await uploadToSignedStorageUrl(signData.uploadUrl, file, {
+          fileName: file.name,
+          contentType: file.type || "application/octet-stream",
         });
         if (!uploadResponse.ok) {
-          throw new Error(`Supabase photo upload failed with ${uploadResponse.status}`);
+          const uploadError = await uploadResponse.text().catch(() => "");
+          throw new Error(`Supabase photo upload failed with ${uploadResponse.status}${uploadError ? `: ${uploadError}` : ""}`);
         }
 
         const previewResponse = await fetch(studioApiUrl(`/api/photo-url?bucket=${encodeURIComponent(signData.bucket)}&path=${encodeURIComponent(signData.path)}`));
@@ -1028,11 +1092,66 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
     }
   };
 
-  const buildAlbumDesign = () => ({
+  const uploadDesignPdf = async () => {
+    const pdfBlob = await createStudioPdfBlob(spreads, {
+      image: {
+        maxDimension: 1800,
+        quality: 0.82,
+        allowOriginalFallback: false,
+      },
+    });
+    const savedStamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileName = `${cleanStorageName(projectName || "album-design", "album-design")}-${savedStamp}-design.pdf`;
+    const targetAlbumFolder = getAlbumFolder();
+    const signResponse = await fetch(studioApiUrl("/api/upload-url"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileName,
+        contentType: "application/pdf",
+        size: pdfBlob.size,
+        path: buildAlbumStoragePath(targetAlbumFolder, "design", fileName),
+      }),
+    });
+    const signData = await signResponse.json().catch(() => ({}));
+    if (!signResponse.ok) {
+      throw new Error(signData.error || `Design PDF upload setup failed with ${signResponse.status}`);
+    }
+
+    const uploadResponse = await uploadToSignedStorageUrl(signData.uploadUrl, pdfBlob, {
+      fileName,
+      contentType: "application/pdf",
+    });
+    if (!uploadResponse.ok) {
+      const uploadError = await uploadResponse.text().catch(() => "");
+      throw new Error(`Design PDF upload failed with ${uploadResponse.status}${uploadError ? `: ${uploadError}` : ""}`);
+    }
+
+    const previewResponse = await fetch(studioApiUrl(`/api/photo-url?bucket=${encodeURIComponent(signData.bucket)}&path=${encodeURIComponent(signData.path)}`));
+    const previewData = await previewResponse.json().catch(() => ({}));
+    if (!previewResponse.ok) {
+      throw new Error(previewData.error || `Design PDF preview setup failed with ${previewResponse.status}`);
+    }
+
+    return {
+      src: previewData.signedUrl || "",
+      storagePath: signData.path,
+      storageBucket: signData.bucket,
+      fileName,
+      contentType: "application/pdf",
+      size: pdfBlob.size,
+      uploaded: true,
+      savedAt: new Date().toISOString(),
+    };
+  };
+
+  const buildAlbumDesign = (designPdf = null) => ({
     version: 1,
     cartItemId: params?.cartItemId || null,
     productSlug: product?.slug,
     projectName,
+    albumFolder: getAlbumFolder(),
+    designPdf,
     isComplete: albumReady,
     filledSlots,
     totalSlots,
@@ -1043,10 +1162,19 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
     savedAt: new Date().toISOString(),
   });
 
-  const handleSaveAndCheckout = () => {
-    if (!albumReady) return;
-    onSaveAlbumDesign?.(buildAlbumDesign(), product);
-    navigate("cart");
+  const handleSaveAndCheckout = async () => {
+    if (!albumReady || savingDesign) return;
+    setSavingDesign(true);
+    setSaveError("");
+    try {
+      const designPdf = await uploadDesignPdf();
+      onSaveAlbumDesign?.(buildAlbumDesign(designPdf), product);
+      navigate("cart");
+    } catch (error) {
+      setSaveError(error.message || "Could not save the album design PDF.");
+    } finally {
+      setSavingDesign(false);
+    }
   };
 
   useEffect(() => {
@@ -1090,7 +1218,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
     <StudioComponentContext.Provider value={{ SmartImage, Logo }}>
       <div className="studio-app" style={{ background: "var(--ink)", color: "var(--paper)", height: "calc(100vh - 50px)", minHeight: 640, display: "flex", flexDirection: "column", overflow: "hidden" }}>
       {/* Top toolbar */}
-      <StudioTopbar projectName={projectName} setProjectName={setProjectName} savedAt={savedAt} navigate={navigate} product={product} albumReady={albumReady} filledSlots={filledSlots} totalSlots={totalSlots} onPreview={() => setPreviewOpen(true)} onDownloadPdf={handleDownloadPdf} onSaveAndCheckout={handleSaveAndCheckout} exportingPdf={exportingPdf} />
+      <StudioTopbar projectName={projectName} setProjectName={setProjectName} savedAt={savedAt} navigate={navigate} product={product} albumReady={albumReady} filledSlots={filledSlots} totalSlots={totalSlots} onPreview={() => setPreviewOpen(true)} onDownloadPdf={handleDownloadPdf} onSaveAndCheckout={handleSaveAndCheckout} exportingPdf={exportingPdf} savingDesign={savingDesign} saveError={saveError} />
 
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: "72px 280px 1fr 320px", overflow: "hidden", minHeight: 0 }}>
         {/* Tool rail */}
@@ -1115,7 +1243,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
   );
 }
 
-function StudioTopbar({ projectName, setProjectName, savedAt, navigate, product, albumReady, filledSlots, totalSlots, onPreview, onDownloadPdf, onSaveAndCheckout, exportingPdf }) {
+function StudioTopbar({ projectName, setProjectName, savedAt, navigate, product, albumReady, filledSlots, totalSlots, onPreview, onDownloadPdf, onSaveAndCheckout, exportingPdf, savingDesign, saveError }) {
   const { Logo } = useStudioComponents();
   return (
     <div style={{ borderBottom: "1px solid rgba(255,255,255,0.08)", padding: "14px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "var(--ink)" }}>
@@ -1150,6 +1278,11 @@ function StudioTopbar({ projectName, setProjectName, savedAt, navigate, product,
         <button className="btn btn-sm" onClick={onPreview} style={{ color: "var(--paper)", border: "1px solid rgba(255,255,255,0.2)" }}>
           Preview
         </button>
+        {saveError && (
+          <span title={saveError} style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--rust)", fontSize: 12 }}>
+            {saveError}
+          </span>
+        )}
         {albumReady ? (
           <button className="btn btn-accent btn-sm" onClick={onDownloadPdf} disabled={exportingPdf}>
             {exportingPdf ? "Preparing PDF..." : "Download PDF"}
@@ -1162,11 +1295,11 @@ function StudioTopbar({ projectName, setProjectName, savedAt, navigate, product,
         <button
           className="btn btn-accent btn-sm"
           onClick={onSaveAndCheckout}
-          disabled={!albumReady}
+          disabled={!albumReady || savingDesign}
           title={albumReady ? "Save album design to cart" : "Fill every image frame before saving"}
-          style={{ opacity: albumReady ? 1 : 0.45, cursor: albumReady ? "pointer" : "default" }}
+          style={{ opacity: albumReady && !savingDesign ? 1 : 0.45, cursor: albumReady && !savingDesign ? "pointer" : "default" }}
         >
-          {albumReady ? `Save & Checkout · $${product.price}` : `Fill pages · ${filledSlots}/${totalSlots}`}
+          {savingDesign ? "Saving design PDF..." : albumReady ? `Save & Checkout · $${product.price}` : `Fill pages · ${filledSlots}/${totalSlots}`}
         </button>
       </div>
     </div>

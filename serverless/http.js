@@ -2,7 +2,7 @@ import { config } from "./config.js";
 
 export function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", config.corsOrigin);
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Shopify-Hmac-Sha256, X-Shopify-Topic, X-Shopify-Webhook-Id");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Storage-Bucket, X-Storage-Path, X-File-Name, X-Shopify-Hmac-Sha256, X-Shopify-Topic, X-Shopify-Webhook-Id");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
 }
 

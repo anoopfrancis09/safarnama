@@ -148,6 +148,7 @@ function collectAlbumAssets(design, albumDesignId = null) {
   };
 
   (design?.photoLibrary || []).forEach(addPhoto);
+  addPhoto(design?.designPdf);
   (design?.spreads || []).forEach((spread) => {
     (spread.items || []).forEach(addPhoto);
   });
