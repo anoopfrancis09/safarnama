@@ -518,7 +518,7 @@ function drawPdfTextBlock(item, pageWidth, pageHeight) {
   return content;
 }
 
-async function downloadStudioPdf(spreads, projectName) {
+export async function downloadStudioPdf(spreads, projectName) {
   const uniqueSources = [...new Set(spreads.flatMap((spread) => (spread.items || []).map((item) => item.src).filter(Boolean)))];
   const loadedImages = new Map();
   await Promise.all(uniqueSources.map(async (src, index) => {
@@ -632,7 +632,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
   const [activeSpread, setActiveSpread] = useState(0);
   const [aspectFilter, setAspectFilter] = useState("4:3");
   const [zoom, setZoom] = useState(100);
-  const [projectName, setProjectName] = useState(initialAlbumDesign?.projectName || "Anika & Ravi · December 2025");
+  const [projectName, setProjectName] = useState(initialAlbumDesign?.projectName || "Album design");
   const [savedAt, setSavedAt] = useState("11:42 AM");
   const [selectedItemIdsBySpread, setSelectedItemIdsBySpread] = useState({});
   const [selectedTextIdsBySpread, setSelectedTextIdsBySpread] = useState({});

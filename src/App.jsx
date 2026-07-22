@@ -1,5 +1,6 @@
 import React from "react";
 import { StudioPage, UploadPage } from "./pages/studio/StudioPage.jsx";
+import AdminPage from "./pages/admin/AdminPage.jsx";
 import "./styles.css";
 
 // ===== shared.jsx =====
@@ -658,6 +659,7 @@ function TopNav({ active, navigate, cartCount = 0 }) {
             <a className={`nav-link ${active === "blog" ? "active" : ""}`} onClick={() => navigate("blog")} style={{cursor:"pointer"}}>Journal</a>
             <a className={`nav-link ${active === "contact" ? "active" : ""}`} onClick={() => navigate("contact")} style={{cursor:"pointer"}}>Contact</a>
             <a className={`nav-link ${active === "status" ? "active" : ""}`} onClick={() => navigate("status")} style={{cursor:"pointer"}}>Order Status</a>
+            <a className={`nav-link ${active === "admin" ? "active" : ""}`} onClick={() => navigate("admin")} style={{cursor:"pointer"}}>Admin</a>
           </div>
         </div>
         <div className="nav-actions">
@@ -3596,6 +3598,7 @@ function App() {
   else if (page === "blog") content = <BlogPage navigate={navigate} />;
   else if (page === "article") content = <ArticlePage navigate={navigate} />;
   else if (page === "contact") content = <ContactPage />;
+  else if (page === "admin") content = <AdminPage />;
   else content = <HomePage navigate={navigate} tweaks={tweaks} />;
 
   return (
@@ -3622,7 +3625,7 @@ function App() {
             </TweakSection>
             <TweakSection title="Quick links">
               <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:6}}>
-                {[["Home","home"],["Shop","shop"],["Product","product"],["Upload","upload"],["Studio","studio"],["Cart","cart"],["Checkout","checkout"],["Confirmation","confirmation"],["Status","status"],["Account","account"],["About","about"],["FAQ","faq"],["Blog","blog"],["Article","article"],["Contact","contact"]].map(([l,p]) => (
+                {[["Home","home"],["Shop","shop"],["Product","product"],["Upload","upload"],["Studio","studio"],["Cart","cart"],["Checkout","checkout"],["Confirmation","confirmation"],["Status","status"],["Admin","admin"],["Account","account"],["About","about"],["FAQ","faq"],["Blog","blog"],["Article","article"],["Contact","contact"]].map(([l,p]) => (
                   <button key={p} onClick={() => navigate(p)} style={{padding:"7px 10px", fontSize:11, border:"1px solid var(--line-2)", borderRadius:6, background:page===p?"var(--ink)":"var(--paper)", color:page===p?"var(--paper)":"var(--ink)"}}>{l}</button>
                 ))}
               </div>
@@ -3634,7 +3637,7 @@ function App() {
 }
 
 function pageLabel(p) {
-  return ({home:"Home",shop:"Shop",product:"Product",upload:"Upload",studio:"Studio",cart:"Cart",checkout:"Checkout",confirmation:"Confirmation",status:"Order Status",account:"Account",about:"About",faq:"FAQ",blog:"Blog",article:"Article",contact:"Contact"})[p] || p;
+  return ({home:"Home",shop:"Shop",product:"Product",upload:"Upload",studio:"Studio",cart:"Cart",checkout:"Checkout",confirmation:"Confirmation",status:"Order Status",admin:"Admin",account:"Account",about:"About",faq:"FAQ",blog:"Blog",article:"Article",contact:"Contact"})[p] || p;
 }
 
 // Color helpers
