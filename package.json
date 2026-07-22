@@ -8,12 +8,19 @@
     "dev:server": "npm --prefix backend run dev",
     "build": "vite build",
     "preview": "vite preview",
-    "server": "npm --prefix backend run start"
+    "server": "npm --prefix backend run start",
+    "dev:vercel": "vercel dev"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@vitejs/plugin-react": "6.0.2",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "vite": "8.0.16"
+  },
+  "devDependencies": {
+    "vercel": "^56.4.1"
   }
 }

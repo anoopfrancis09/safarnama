@@ -153,7 +153,17 @@ const SHOPIFY_CONFIG = {
   storefrontToken: import.meta.env.VITE_SHOPIFY_STOREFRONT_PUBLIC_TOKEN,
   apiVersion: import.meta.env.VITE_SHOPIFY_API_VERSION || "2026-04",
 };
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8787";
+function resolveApiBaseUrl(rawValue) {
+  const configured = (rawValue || "").trim().replace(/\/$/, "");
+  if (configured.includes("localhost") && import.meta.env.PROD) return "";
+  if (configured) return configured;
+  if (import.meta.env.DEV && typeof window !== "undefined" && window.location.hostname === "localhost" && window.location.port && window.location.port !== "3000") {
+    return "http://localhost:3000";
+  }
+  return "";
+}
+
+const API_BASE_URL = resolveApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
 const SHOPIFY_PRODUCTS_QUERY = `
   query SafarnamaProducts {

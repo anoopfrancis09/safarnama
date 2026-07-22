@@ -7,3 +7,4 @@ backend/data/*.json
 backend/data/*.tmp
 .DS_Store
 .env
+.vercel

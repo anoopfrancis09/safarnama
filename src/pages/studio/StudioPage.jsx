@@ -244,6 +244,17 @@ const STUDIO_LAYOUT_SLOTS = {
 
 const DEFAULT_SPREAD_BACKGROUND = "#FBF8F2";
 const BACKGROUND_SWATCHES = ["#FBF8F2", "#F4EFE6", "#E4DBC9", "#FFFFFF", "#1C1A17", "#3A1F1A", "#7A8569", "#9A6B3F", "#7A2A2A"];
+function resolveStudioApiBaseUrl(rawValue) {
+  const configured = (rawValue || "").trim().replace(/\/$/, "");
+  if (configured.includes("localhost") && import.meta.env.PROD) return "";
+  if (configured) return configured;
+  if (import.meta.env.DEV && typeof window !== "undefined" && window.location.hostname === "localhost" && window.location.port && window.location.port !== "3000") {
+    return "http://localhost:3000";
+  }
+  return "";
+}
+
+const STUDIO_API_BASE_URL = resolveStudioApiBaseUrl(import.meta.env.VITE_API_BASE_URL);
 
 function isCoverLayout(layout) {
   return layout === "cover" || layout === "back-cover";
@@ -251,6 +262,31 @@ function isCoverLayout(layout) {
 
 function clampStudioValue(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function studioApiUrl(path) {
+  return `${STUDIO_API_BASE_URL}${path}`;
+}
+
+function photoPatch(photoOrSrc) {
+  if (typeof photoOrSrc === "string") return { src: photoOrSrc };
+  if (!photoOrSrc) return { src: "" };
+
+  return {
+    src: photoOrSrc.src || "",
+    storagePath: photoOrSrc.storagePath || photoOrSrc.path || "",
+    storageBucket: photoOrSrc.storageBucket || photoOrSrc.bucket || "",
+    fileName: photoOrSrc.fileName || photoOrSrc.name || "",
+    contentType: photoOrSrc.contentType || "",
+  };
+}
+
+function clearPhotoPatch() {
+  return { src: "", storagePath: "", storageBucket: "", fileName: "", contentType: "" };
+}
+
+function copyPhotoMetadata(item) {
+  return photoPatch(item);
 }
 
 function makeStudioItem(slot, src, index) {
@@ -272,6 +308,10 @@ function normalizeStudioItem(item) {
     ...item,
     focalX: item.focalX ?? 50,
     focalY: item.focalY ?? 50,
+    storagePath: item.storagePath || "",
+    storageBucket: item.storageBucket || "",
+    fileName: item.fileName || "",
+    contentType: item.contentType || "",
   };
 }
 
@@ -312,6 +352,8 @@ function createItemsForLayout(layout, photos = [], previousItems = []) {
     const previous = source ? previousBySource.get(source) : previousItems[index];
     return normalizeStudioItem({
       ...makeStudioItem(slot, source, index),
+      ...copyPhotoMetadata(previous),
+      src: source,
       focalX: previous?.focalX ?? 50,
       focalY: previous?.focalY ?? 50,
     });
@@ -764,7 +806,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
       return;
     }
     if (selectedItem) {
-      updateItem(selectedItem.id, { src: "" });
+      updateItem(selectedItem.id, clearPhotoPatch());
     }
   };
 
@@ -776,7 +818,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
       return true;
     }
     if (selectedItem?.src) {
-      clipboardRef.current = { type: "photo", src: selectedItem.src };
+      clipboardRef.current = { type: "photo", photo: copyPhotoMetadata(selectedItem) };
       return true;
     }
     return false;
@@ -806,10 +848,11 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
       });
       return;
     }
-    if (clip?.type === "photo" && clip.src) {
+    if (clip?.type === "photo" && (clip.photo?.src || clip.src)) {
       updateSpread(spreadIndex, (spread) => {
         const items = spread.items || [];
-        const newItem = makeStudioItem({ id: "pasted-photo", x: 30, y: 28, w: 32, h: 36 }, clip.src, items.length);
+        const patch = photoPatch(clip.photo || clip.src);
+        const newItem = { ...makeStudioItem({ id: "pasted-photo", x: 30, y: 28, w: 32, h: 36 }, patch.src, items.length), ...patch };
         setSelectedItemForSpread(spreadIndex, newItem.id);
         setSelectedTextForSpread(spreadIndex, null);
         return { ...spread, items: [...items, newItem] };
@@ -830,23 +873,24 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
     }
   };
 
-  const placePhoto = (src, targetItemId, point) => {
+  const placePhoto = (photo, targetItemId, point) => {
     const spreadIndex = activeSpread;
+    const patch = { ...photoPatch(photo), focalX: 50, focalY: 50 };
     updateSpread(spreadIndex, (spread) => {
       const items = spread.items || [];
       if (targetItemId && items.some((item) => item.id === targetItemId)) {
         setSelectedItemForSpread(spreadIndex, targetItemId);
         setSelectedTextForSpread(spreadIndex, null);
-        return { ...spread, items: items.map((item) => item.id === targetItemId ? { ...item, src, focalX: 50, focalY: 50 } : item) };
+        return { ...spread, items: items.map((item) => item.id === targetItemId ? { ...item, ...patch } : item) };
       }
       const emptyItem = items.find((item) => !item.src);
       if (emptyItem) {
         setSelectedItemForSpread(spreadIndex, emptyItem.id);
         setSelectedTextForSpread(spreadIndex, null);
-        return { ...spread, items: items.map((item) => item.id === emptyItem.id ? { ...item, src, focalX: 50, focalY: 50 } : item) };
+        return { ...spread, items: items.map((item) => item.id === emptyItem.id ? { ...item, ...patch } : item) };
       }
       const customSlot = { id: "custom-photo", x: point?.x ?? 30, y: point?.y ?? 30, w: 28, h: 32 };
-      const newItem = makeStudioItem(customSlot, src, items.length);
+      const newItem = { ...makeStudioItem(customSlot, patch.src, items.length), ...patch };
       setSelectedItemForSpread(spreadIndex, newItem.id);
       setSelectedTextForSpread(spreadIndex, null);
       return { ...spread, items: [...items, newItem] };
@@ -889,18 +933,75 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
     setActiveTool("photos");
   };
 
-  const handleUploadLibrary = (event) => {
+  const handleUploadLibrary = async (event) => {
     const files = [...event.target.files];
     if (!files.length) return;
-    setPhotoBin((current) => [
-      ...current,
-      ...files.map((file, index) => ({
-        id: `upload-${Date.now()}-${index}`,
-        name: file.name,
-        src: URL.createObjectURL(file),
-      })),
-    ]);
+    const pendingPhotos = files.map((file, index) => ({
+      id: `upload-${Date.now()}-${index}`,
+      name: file.name,
+      fileName: file.name,
+      contentType: file.type || "application/octet-stream",
+      size: file.size,
+      src: URL.createObjectURL(file),
+      uploading: true,
+    }));
+    setPhotoBin((current) => [...current, ...pendingPhotos]);
     event.target.value = "";
+
+    const uploadedPhotos = await Promise.all(pendingPhotos.map(async (photo, index) => {
+      const file = files[index];
+      try {
+        const signResponse = await fetch(studioApiUrl("/api/upload-url"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fileName: file.name,
+            contentType: file.type || "application/octet-stream",
+            size: file.size,
+          }),
+        });
+        const signData = await signResponse.json().catch(() => ({}));
+        if (!signResponse.ok) {
+          throw new Error(signData.error || `Photo upload setup failed with ${signResponse.status}`);
+        }
+        if (!signData.uploadUrl) {
+          throw new Error("The upload endpoint did not return a signed URL.");
+        }
+
+        const uploadResponse = await fetch(signData.uploadUrl, {
+          method: "PUT",
+          headers: { "Content-Type": file.type || "application/octet-stream" },
+          body: file,
+        });
+        if (!uploadResponse.ok) {
+          throw new Error(`Supabase photo upload failed with ${uploadResponse.status}`);
+        }
+
+        const previewResponse = await fetch(studioApiUrl(`/api/photo-url?bucket=${encodeURIComponent(signData.bucket)}&path=${encodeURIComponent(signData.path)}`));
+        const previewData = await previewResponse.json().catch(() => ({}));
+        if (!previewResponse.ok) {
+          throw new Error(previewData.error || `Photo preview setup failed with ${previewResponse.status}`);
+        }
+
+        return {
+          ...photo,
+          src: previewData.signedUrl || photo.src,
+          storagePath: signData.path,
+          storageBucket: signData.bucket,
+          uploading: false,
+          uploaded: true,
+        };
+      } catch (error) {
+        return {
+          ...photo,
+          uploading: false,
+          uploaded: false,
+          uploadError: error.message || "Photo upload failed; using a temporary preview.",
+        };
+      }
+    }));
+
+    setPhotoBin((current) => current.map((photo) => uploadedPhotos.find((uploaded) => uploaded.id === photo.id) || photo));
   };
 
   const autofillRemaining = () => {
@@ -912,7 +1013,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
         if (item.src) return item;
         const photo = photoBin[cursor % photoBin.length];
         cursor += 1;
-        return { ...item, src: photo?.src || "", focalX: 50, focalY: 50 };
+        return { ...item, ...photoPatch(photo), focalX: 50, focalY: 50 };
       }),
     }));
   };
@@ -996,13 +1097,13 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
         <StudioRail active={activeTool} setActive={setActiveTool} />
 
         {/* Left panel */}
-        <StudioLeftPanel tool={activeTool} photoBin={photoBin} spreads={spreads} activeSpread={activeSpread} setActiveSpread={setActiveSpread} onPickPhoto={(src) => placePhoto(src)} onAddSpread={handleAddSpread} onUploadClick={() => uploadInputRef.current?.click()} selectedText={selectedText} onAddText={addTextItem} onUpdateText={(patch) => selectedText && updateTextItem(selectedText.id, patch)} onRemoveText={() => selectedText && removeTextItem(selectedText.id)} backgroundColor={activeBackgroundColor} onUpdateBackground={updateActiveBackground} />
+        <StudioLeftPanel tool={activeTool} photoBin={photoBin} spreads={spreads} activeSpread={activeSpread} setActiveSpread={setActiveSpread} onPickPhoto={(photo) => placePhoto(photo)} onAddSpread={handleAddSpread} onUploadClick={() => uploadInputRef.current?.click()} selectedText={selectedText} onAddText={addTextItem} onUpdateText={(patch) => selectedText && updateTextItem(selectedText.id, patch)} onRemoveText={() => selectedText && removeTextItem(selectedText.id)} backgroundColor={activeBackgroundColor} onUpdateBackground={updateActiveBackground} />
 
         {/* Canvas */}
         <StudioCanvas spread={activeSpreadData} zoom={zoom} setZoom={setZoom} activeIndex={activeSpread} totalSpreads={spreads.length} setActiveSpread={setActiveSpread} selectedItemId={selectedItemId} setSelectedItemId={(itemId) => { setSelectedItemForSpread(activeSpread, itemId); setSelectedTextForSpread(activeSpread, null); }} selectedTextId={selectedTextId} setSelectedTextId={selectTextItem} onPlacePhoto={placePhoto} onUpdateItem={updateItem} onRemoveImageSection={removeImageSection} onUpdateTextItem={updateTextItem} onDeleteTextItem={removeTextItem} onBeginTransform={saveHistorySnapshot} />
 
         {/* Right panel */}
-        <StudioRightPanel layout={activeLayout} setLayout={applyLayout} aspectFilter={aspectFilter} setAspectFilter={setAspectFilter} selectedItem={selectedItem} onUpdateItem={updateItem} onAddImageSection={addImageSection} onRemoveImageSection={() => selectedItem && removeImageSection(selectedItem.id)} onRemoveImage={() => selectedItem && updateItem(selectedItem.id, { src: "" })} onAutofill={autofillRemaining} albumReady={albumReady} filledSlots={filledSlots} totalSlots={totalSlots} hasPhotos={photoBin.length > 0} />
+        <StudioRightPanel layout={activeLayout} setLayout={applyLayout} aspectFilter={aspectFilter} setAspectFilter={setAspectFilter} selectedItem={selectedItem} onUpdateItem={updateItem} onAddImageSection={addImageSection} onRemoveImageSection={() => selectedItem && removeImageSection(selectedItem.id)} onRemoveImage={() => selectedItem && updateItem(selectedItem.id, clearPhotoPatch())} onAutofill={autofillRemaining} albumReady={albumReady} filledSlots={filledSlots} totalSlots={totalSlots} hasPhotos={photoBin.length > 0} />
       </div>
       <input ref={uploadInputRef} type="file" accept="image/*" multiple onChange={handleUploadLibrary} style={{ display: "none" }} />
 
@@ -1342,15 +1443,25 @@ function StudioLeftPanel({ tool, photoBin, spreads, activeSpread, setActiveSprea
                 <button
                   key={photo.id}
                   draggable
-                  onClick={() => onPickPhoto(photo.src)}
+                  onClick={() => onPickPhoto(photo)}
                   onDragStart={(event) => {
-                    event.dataTransfer.setData("application/safarnama-photo", JSON.stringify({ src: photo.src }));
+                    event.dataTransfer.setData("application/safarnama-photo", JSON.stringify(photoPatch(photo)));
                     event.dataTransfer.effectAllowed = "copy";
                   }}
                   title={`Place ${photo.name}`}
                   style={{ aspectRatio: "1", borderRadius: 4, overflow: "hidden", cursor: "grab", position: "relative", border: "1px solid rgba(255,255,255,0.08)", padding: 0, background: "transparent" }}
                 >
                   <SmartImage src={photo.src} alt={photo.name} className="img-fill" />
+                  {photo.uploading && (
+                    <span style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.42)", color: "var(--paper)", fontSize: 10 }}>
+                      Uploading
+                    </span>
+                  )}
+                  {photo.uploadError && (
+                    <span title={photo.uploadError} style={{ position: "absolute", right: 4, bottom: 4, width: 16, height: 16, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(122,42,42,0.92)", color: "white", fontSize: 10 }}>
+                      !
+                    </span>
+                  )}
                 </button>
               ))}
             </div>
@@ -1526,9 +1637,9 @@ function StudioCanvas({ spread, zoom, setZoom, activeIndex, totalSpreads, setAct
     if (!spreadRef.current) return;
     const payload = event.dataTransfer.getData("application/safarnama-photo");
     if (!payload) return;
-    const { src } = JSON.parse(payload);
+    const photo = JSON.parse(payload);
     const rect = spreadRef.current.getBoundingClientRect();
-    onPlacePhoto(src, null, {
+    onPlacePhoto(photo, null, {
       x: clampStudioValue(((event.clientX - rect.left) / rect.width) * 100 - 14, 0, 72),
       y: clampStudioValue(((event.clientY - rect.top) / rect.height) * 100 - 16, 0, 68),
     });
@@ -1642,8 +1753,8 @@ function PhotoFrame({ item, selected, onSelect, onPlacePhoto, onDelete, onStartD
     event.stopPropagation();
     const payload = event.dataTransfer.getData("application/safarnama-photo");
     if (!payload) return;
-    const { src } = JSON.parse(payload);
-    onPlacePhoto(src, item.id);
+    const photo = JSON.parse(payload);
+    onPlacePhoto(photo, item.id);
   };
   return (
     <div
