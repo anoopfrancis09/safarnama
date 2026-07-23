@@ -413,14 +413,15 @@ function cartItemKey({ slug, size, pages, cover, paper }) {
   return [slug, size, pages, cover, paper].join("::");
 }
 
-function buildCartItem({ product, size, pages, cover, paper, qty, albumDesign, project, status }) {
+function buildCartItem({ product, size, pages, cover, paper, qty, albumDesign, project, status, professionalDesignRequest }) {
   const variant = findMatchingVariant(product, { size, pages, cover, paper });
   const price = variant?.price || getConfiguredUnitPrice(product, pages, cover);
   const key = cartItemKey({ slug: product.slug, size, pages, cover, paper });
+  const id = professionalDesignRequest?.requested ? `${key}::team-design::${Date.now()}` : key;
   const configParts = [size, `${pages} pages`, cover, paper].filter(Boolean);
 
   return {
-    id: key,
+    id,
     slug: product.slug,
     name: product.name,
     tier: product.tier,
@@ -431,10 +432,11 @@ function buildCartItem({ product, size, pages, cover, paper, qty, albumDesign, p
     variantId: variant?.id,
     variantTitle: variant?.title,
     qty,
-    status: status || (albumDesign?.isComplete ? "Designed" : "Awaiting photos"),
+    status: status || (professionalDesignRequest?.requested ? "Team design requested" : albumDesign?.isComplete ? "Designed" : "Awaiting photos"),
     thumb: product.image,
-    project: project || albumDesign?.projectName || "New album",
+    project: project || albumDesign?.projectName || professionalDesignRequest?.projectName || "New album",
     albumDesign: albumDesign || null,
+    professionalDesignRequest: professionalDesignRequest || null,
   };
 }
 
@@ -492,6 +494,8 @@ function createShopifyCartAttributes(item) {
     ["Album design", item.albumDesign?.isComplete ? "Complete" : ""],
     ["Album spreads", item.albumDesign?.spreadCount],
     ["Album pages", item.albumDesign?.pageCount],
+    ["Design service", item.professionalDesignRequest?.requested ? "Professional team design requested" : ""],
+    ["Uploaded assets", item.professionalDesignRequest?.assets?.length],
   ]
     .filter(([, value]) => value)
     .map(([key, value]) => ({ key, value: String(value) }));
@@ -519,6 +523,7 @@ async function createShopifyCheckout(items) {
       project: item.project,
       status: item.status,
       albumDesign: item.albumDesign || null,
+      professionalDesignRequest: item.professionalDesignRequest || null,
       attributes: createShopifyCartAttributes(item),
     };
   });
@@ -2050,8 +2055,8 @@ function ProductPage({ navigate, params, onAddToCart }) {
                   <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6 }}>or 4 × {formatCurrency(Math.round(total/4), product.currency)} with Afterpay</div>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  <button className="btn btn-primary btn-lg" onClick={() => navigate("studio", { slug: product.slug })}>
-                    Start designing →
+                  <button className="btn btn-primary btn-lg" onClick={() => navigate("upload", { slug: product.slug, size, pages, cover, paper, qty })}>
+                    Begin uploading →
                   </button>
                   <button className="btn btn-ghost btn-sm" onClick={addCurrentSelectionToCart} disabled={adding} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: adding ? 0.78 : 1 }}>
                     {adding && <span className="spinner" aria-hidden="true"></span>}
@@ -2342,8 +2347,9 @@ function CartPage({ navigate, items, setItems }) {
 }
 
 function CartItem({ item, navigate, setItems, items }) {
-  const statusColor = item.status === "Designed" ? "var(--ok)" : item.status === "In studio" ? "var(--accent)" : "var(--muted)";
-  const designSummary = item.albumDesign ? `${item.albumDesign.spreadCount} spreads · ${item.albumDesign.pageCount} pages` : "No saved design";
+  const isTeamDesign = Boolean(item.professionalDesignRequest?.requested);
+  const statusColor = item.status === "Designed" ? "var(--ok)" : item.status === "In studio" || isTeamDesign ? "var(--accent)" : "var(--muted)";
+  const designSummary = isTeamDesign ? `${item.professionalDesignRequest?.assets?.length || 0} uploaded photos · team design requested` : item.albumDesign ? `${item.albumDesign.spreadCount} spreads · ${item.albumDesign.pageCount} pages` : "No saved design";
   return (
     <div className="card" style={{ padding: 24, display: "grid", gridTemplateColumns: "120px 1fr auto", gap: 24 }}>
       <div style={{ aspectRatio: "1", borderRadius: "var(--r-md)", overflow: "hidden" }}>
@@ -2369,7 +2375,9 @@ function CartItem({ item, navigate, setItems, items }) {
           <span style={{ fontSize: 12, color: "var(--muted)" }}>· {designSummary}</span>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
-          <button className="btn btn-ghost btn-sm" onClick={() => navigate("studio", { slug: item.slug, cartItemId: item.id })}>Edit design</button>
+          {!isTeamDesign && (
+            <button className="btn btn-ghost btn-sm" onClick={() => navigate("studio", { slug: item.slug, cartItemId: item.id })}>Edit design</button>
+          )}
           <button className="btn btn-ghost btn-sm" onClick={() => setItems(items.map(i => i.id === item.id ? {...i, qty: i.qty+1} : i))}>Duplicate</button>
           <button className="btn btn-ghost btn-sm" style={{ color: "var(--rust)" }} onClick={() => setItems(items.filter(i => i.id !== item.id))}>Remove</button>
         </div>
@@ -2467,6 +2475,11 @@ function CheckoutPage({ navigate, items = [] }) {
                         {b.albumDesign && (
                           <div style={{ fontSize: 11, color: "var(--accent-deep)", marginTop: 4 }}>
                             Design JSON saved · {b.albumDesign.spreadCount} spreads · {b.albumDesign.pageCount} pages
+                          </div>
+                        )}
+                        {b.professionalDesignRequest?.requested && (
+                          <div style={{ fontSize: 11, color: "var(--accent-deep)", marginTop: 4 }}>
+                            Team design requested · {b.professionalDesignRequest.assets?.length || 0} uploaded photos
                           </div>
                         )}
                       </div>
@@ -3470,6 +3483,7 @@ function App() {
   const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const productData = useShopifyProducts();
   const [cartItems, setCartItems] = React.useState([]);
+  const [pendingUploadPhotosBySlug, setPendingUploadPhotosBySlug] = React.useState({});
 
   const addToCart = React.useCallback((item) => {
     setCartItems((current) => {
@@ -3487,11 +3501,11 @@ function App() {
     if (!product || !albumDesign) return;
     setCartItems((current) => {
       const existingByRoute = albumDesign.cartItemId ? current.find((item) => item.id === albumDesign.cartItemId) : null;
-      const size = existingByRoute?.details?.size || product.sizes?.[0] || "";
-      const pages = existingByRoute?.details?.pages || product.pages?.[1] || product.pages?.[0] || albumDesign.pageCount || 0;
-      const cover = existingByRoute?.details?.cover || product.cover?.[0] || "";
-      const paper = existingByRoute?.details?.paper || product.paper?.[0] || "";
-      const qty = existingByRoute?.qty || 1;
+      const size = existingByRoute?.details?.size || albumDesign.details?.size || product.sizes?.[0] || "";
+      const pages = Number(existingByRoute?.details?.pages || albumDesign.details?.pages || product.pages?.[1] || product.pages?.[0] || albumDesign.pageCount || 0);
+      const cover = existingByRoute?.details?.cover || albumDesign.details?.cover || product.cover?.[0] || "";
+      const paper = existingByRoute?.details?.paper || albumDesign.details?.paper || product.paper?.[0] || "";
+      const qty = Number(existingByRoute?.qty || albumDesign.qty || 1);
       const draftItem = buildCartItem({
         product,
         size,
@@ -3520,6 +3534,56 @@ function App() {
       }
       return [...current, savedItem];
     });
+    setPendingUploadPhotosBySlug((current) => {
+      if (!current[product.slug]) return current;
+      const next = { ...current };
+      delete next[product.slug];
+      return next;
+    });
+  }, []);
+
+  const saveProfessionalDesignToCart = React.useCallback((slug, request) => {
+    const product = productData.products.find((item) => item.slug === slug) || productData.products[0];
+    if (!product || !request) return;
+    const size = request.details?.size || product.sizes?.[0] || "";
+    const pages = Number(request.details?.pages || product.pages?.[1] || product.pages?.[0] || 0);
+    const cover = request.details?.cover || product.cover?.[0] || "";
+    const paper = request.details?.paper || product.paper?.[0] || "";
+    const qty = Number(request.qty || 1);
+    const professionalDesignRequest = {
+      requested: true,
+      projectName: request.projectName || `${product.name} professional design`,
+      albumFolder: request.albumFolder || "",
+      assets: request.assets || [],
+      requestedAt: new Date().toISOString(),
+    };
+
+    addToCart(buildCartItem({
+      product,
+      size,
+      pages,
+      cover,
+      paper,
+      qty,
+      professionalDesignRequest,
+      project: professionalDesignRequest.projectName,
+      status: "Team design requested",
+    }));
+
+    setPendingUploadPhotosBySlug((current) => {
+      if (!current[slug]) return current;
+      const next = { ...current };
+      delete next[slug];
+      return next;
+    });
+  }, [addToCart, productData.products]);
+
+  const savePendingUploadPhotos = React.useCallback((slug, uploadDraft) => {
+    if (!slug) return;
+    setPendingUploadPhotosBySlug((current) => ({
+      ...current,
+      [slug]: uploadDraft,
+    }));
   }, []);
 
   React.useEffect(() => {
@@ -3581,13 +3645,16 @@ function App() {
 
   const showShell = page !== "studio" && page !== "checkout";
   const activeStudioCartItem = params?.cartItemId ? cartItems.find((item) => item.id === params.cartItemId) : null;
+  const pendingUploadDraft = pendingUploadPhotosBySlug[params?.slug] || {};
+  const pendingUploadPhotos = Array.isArray(pendingUploadDraft) ? pendingUploadDraft : pendingUploadDraft.photos || [];
+  const pendingUploadAlbumFolder = Array.isArray(pendingUploadDraft) ? "" : pendingUploadDraft.albumFolder || "";
 
   let content;
   if (page === "home") content = <HomePage navigate={navigate} tweaks={tweaks} />;
   else if (page === "shop") content = <ShopPage navigate={navigate} tweaks={tweaks} />;
   else if (page === "product") content = <ProductPage navigate={navigate} params={params} onAddToCart={addToCart} />;
-  else if (page === "upload") content = <UploadPage navigate={navigate} params={params} products={productData.products} stock={STOCK} SmartImage={SmartImage} />;
-  else if (page === "studio") content = <StudioPage navigate={navigate} params={params} products={productData.products} SmartImage={SmartImage} Logo={Logo} initialAlbumDesign={activeStudioCartItem?.albumDesign || null} onSaveAlbumDesign={saveAlbumDesignToCart} />;
+  else if (page === "upload") content = <UploadPage navigate={navigate} params={params} products={productData.products} SmartImage={SmartImage} initialPhotos={pendingUploadPhotos} initialAlbumFolder={pendingUploadAlbumFolder} onContinueWithPhotos={savePendingUploadPhotos} onProfessionalDesign={saveProfessionalDesignToCart} />;
+  else if (page === "studio") content = <StudioPage navigate={navigate} params={params} products={productData.products} SmartImage={SmartImage} Logo={Logo} initialAlbumDesign={activeStudioCartItem?.albumDesign || null} initialPhotoLibrary={pendingUploadPhotos} initialAlbumFolder={pendingUploadAlbumFolder} onSaveAlbumDesign={saveAlbumDesignToCart} />;
   else if (page === "cart") content = <CartPage navigate={navigate} items={cartItems} setItems={setCartItems} />;
   else if (page === "checkout") content = <CheckoutPage navigate={navigate} items={cartItems} />;
   else if (page === "confirmation") content = <ConfirmationPage navigate={navigate} />;

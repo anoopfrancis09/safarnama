@@ -54,6 +54,7 @@ function collectDesignAssets(design) {
   };
 
   (design?.photoLibrary || []).forEach(add);
+  (design?.assets || []).forEach(add);
   (design?.spreads || []).forEach((spread) => {
     (spread.items || []).forEach(add);
   });
@@ -271,12 +272,33 @@ async function downloadAsset(asset) {
 
 function getCheckoutDesigns(checkout) {
   return (checkout.items || [])
-    .filter((item) => item.albumDesign)
-    .map((item) => ({
-      item,
-      design: item.albumDesign,
-      assets: collectDesignAssets(item.albumDesign),
-    }));
+    .flatMap((item) => {
+      const jobs = [];
+      if (item.albumDesign) {
+        jobs.push({
+          kind: "customer-design",
+          item,
+          design: item.albumDesign,
+          assets: collectDesignAssets(item.albumDesign),
+        });
+      }
+      if (item.professionalDesignRequest?.requested) {
+        jobs.push({
+          kind: "team-design",
+          item,
+          design: {
+            cartItemId: item.id,
+            projectName: item.professionalDesignRequest.projectName || item.project || "Team design request",
+            albumFolder: item.professionalDesignRequest.albumFolder || "",
+            assets: item.professionalDesignRequest.assets || [],
+            teamDesignRequest: true,
+            requestedAt: item.professionalDesignRequest.requestedAt,
+          },
+          assets: collectDesignAssets(item.professionalDesignRequest),
+        });
+      }
+      return jobs;
+    });
 }
 
 export function AdminPage() {
@@ -379,7 +401,7 @@ export function AdminPage() {
           <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 24 }}>
             <AdminStat label="Checkouts" value={stats.checkouts} />
             <AdminStat label="Paid" value={stats.paid} />
-            <AdminStat label="Album designs" value={stats.designs} />
+            <AdminStat label="Album jobs" value={stats.designs} />
             <AdminStat label="Assets tracked" value={stats.assets} />
           </div>
 
@@ -439,7 +461,7 @@ function AdminCheckoutCard({ checkout, busyAction, onDownloadPdf, onDownloadAsse
           <h2 style={{ margin: "0 0 8px", fontSize: 22, letterSpacing: "-0.015em" }}>{checkout.appOrderId || checkout.appCartId}</h2>
           <div style={{ color: "var(--ink-3)", fontSize: 13, display: "flex", gap: 14, flexWrap: "wrap" }}>
             <span>{itemCount} item{itemCount === 1 ? "" : "s"}</span>
-            <span>{designs.length} album design{designs.length === 1 ? "" : "s"}</span>
+            <span>{designs.length} album job{designs.length === 1 ? "" : "s"}</span>
             {checkout.shopifyCartId && <span>Shopify cart saved</span>}
           </div>
         </div>
@@ -451,30 +473,35 @@ function AdminCheckoutCard({ checkout, busyAction, onDownloadPdf, onDownloadAsse
       <div style={{ marginTop: 20, display: "flex", flexDirection: "column", gap: 12 }}>
         {designs.length === 0 ? (
           <div style={{ padding: 16, background: "var(--bg-2)", borderRadius: "var(--r-sm)", color: "var(--ink-3)", fontSize: 13 }}>
-            This checkout has no saved album design JSON.
+            This checkout has no album design job yet.
           </div>
-        ) : designs.map(({ item, design, assets: designAssets }) => {
-          const actionKey = `${checkout.appCartId}-${design.cartItemId || design.projectName}`;
+        ) : designs.map(({ item, design, assets: designAssets, kind }) => {
+          const isTeamDesign = kind === "team-design";
+          const actionKey = `${checkout.appCartId}-${item.id || design.cartItemId || design.projectName}`;
           return (
             <div key={item.id || design.cartItemId || design.projectName} style={{ padding: 16, border: "1px solid var(--line)", borderRadius: "var(--r-md)", background: "var(--paper)" }}>
               <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 18, alignItems: "center" }}>
                 <div>
-                  <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 5 }}>{item.tier || "Album"} · {item.variantTitle || "Selected variant"}</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: 0.06, textTransform: "uppercase", marginBottom: 5 }}>{item.tier || "Album"} · {isTeamDesign ? "Team design requested" : item.variantTitle || "Selected variant"}</div>
                   <h3 style={{ margin: "0 0 6px", fontSize: 18, letterSpacing: "-0.01em" }}>{item.name || design.projectName || "Album design"}</h3>
                   <div style={{ fontSize: 13, color: "var(--ink-3)" }}>
-                    {design.projectName || "Untitled project"} · {design.spreadCount || 0} spreads · {design.pageCount || 0} pages · {designAssets.length} assets
+                    {isTeamDesign ? `${design.projectName || "Team design request"} · internal team to design · ${designAssets.length} assets` : `${design.projectName || "Untitled project"} · ${design.spreadCount || 0} spreads · ${design.pageCount || 0} pages · ${designAssets.length} assets`}
                   </div>
                 </div>
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
-                  <button className="btn btn-primary btn-sm" onClick={() => onDownloadPdf(checkout, design)} disabled={busyAction === `pdf-${actionKey}`}>
-                    {busyAction === `pdf-${actionKey}` ? "Creating PDF..." : "Download PDF"}
-                  </button>
+                  {!isTeamDesign && (
+                    <button className="btn btn-primary btn-sm" onClick={() => onDownloadPdf(checkout, design)} disabled={busyAction === `pdf-${actionKey}`}>
+                      {busyAction === `pdf-${actionKey}` ? "Creating PDF..." : "Download PDF"}
+                    </button>
+                  )}
                   <button className="btn btn-ghost btn-sm" onClick={() => onDownloadAssets(checkout, design)} disabled={!designAssets.length || busyAction === `assets-${actionKey}`}>
                     {busyAction === `assets-${actionKey}` ? "Creating ZIP..." : "Download ZIP"}
                   </button>
-                  <button className="btn btn-ghost btn-sm" onClick={() => downloadJson(design, `${cleanFileName(design.projectName || checkout.appOrderId, "album-design")}.json`)}>
-                    Design JSON
-                  </button>
+                  {!isTeamDesign && (
+                    <button className="btn btn-ghost btn-sm" onClick={() => downloadJson(design, `${cleanFileName(design.projectName || checkout.appOrderId, "album-design")}.json`)}>
+                      Design JSON
+                    </button>
+                  )}
                 </div>
               </div>
 

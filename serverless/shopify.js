@@ -66,6 +66,8 @@ function cartLineAttributes(item, appCartId, appOrderId) {
     { key: "Album design", value: item.albumDesign?.isComplete ? "Complete" : "" },
     { key: "Album spreads", value: item.albumDesign?.spreadCount },
     { key: "Album pages", value: item.albumDesign?.pageCount },
+    { key: "Design service", value: item.professionalDesignRequest?.requested ? "Professional team design requested" : "" },
+    { key: "Uploaded assets", value: item.professionalDesignRequest?.assets?.length },
   ];
 
   return base.filter((attribute) => attribute.value).map((attribute) => ({

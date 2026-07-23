@@ -31,6 +31,7 @@ export default async function handler(req, res) {
       metadata: {
         source: "vercel",
         albumDesignCount: items.filter((item) => item.albumDesign).length,
+        professionalDesignCount: items.filter((item) => item.professionalDesignRequest?.requested).length,
       },
       createdAt: new Date().toISOString(),
     };

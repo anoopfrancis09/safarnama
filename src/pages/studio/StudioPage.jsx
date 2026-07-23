@@ -25,28 +25,127 @@ function useStudioComponents() {
 
 // ===== page-studio.jsx =====
 // Photo upload + Design Studio (deep editor)
-export function UploadPage({ navigate, params, products = [], stock = {}, SmartImage = DefaultSmartImage }) {
-  const product = products.find(p => p.slug === params?.slug) || products[0];
-  const [files, setFiles] = useState([]);
-  const [dragOver, setDragOver] = useState(false);
-  const [uploadingIdx, setUploadingIdx] = useState(-1);
+function formatUploadFileSize(size = 0) {
+  if (!size) return "0 KB";
+  if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(size / 1024))} KB`;
+}
 
-  // Pre-seed a few demo images
+function imageResolutionFromUrl(src) {
+  return new Promise((resolve) => {
+    const image = new Image();
+    image.onload = () => resolve({ width: image.naturalWidth || 0, height: image.naturalHeight || 0 });
+    image.onerror = () => resolve({ width: 0, height: 0 });
+    image.src = src;
+  });
+}
+
+function isLowResolutionPhoto(width, height) {
+  return Boolean(width && height && Math.max(width, height) < 3000);
+}
+
+function isUploadableImageFile(file) {
+  return Boolean(file?.type?.startsWith("image/") || /\.(jpe?g|png|webp|heic|heif|tiff?)$/i.test(file?.name || ""));
+}
+
+function stripRuntimePhotoFields(photo) {
+  const { file, localSrc, ...metadata } = photo || {};
+  return metadata;
+}
+
+export function UploadPage({ navigate, params, products = [], SmartImage = DefaultSmartImage, initialPhotos = [], initialAlbumFolder = "", onContinueWithPhotos, onProfessionalDesign }) {
+  const product = products.find(p => p.slug === params?.slug) || products[0];
+  const selectedDetails = {
+    size: params?.size || product.sizes?.[0] || "",
+    pages: params?.pages || product.pages?.[1] || product.pages?.[0] || "",
+    cover: params?.cover || product.cover?.[0] || "",
+    paper: params?.paper || product.paper?.[0] || "",
+  };
+  const inputRef = useRef(null);
+  const albumFolderRef = useRef(initialAlbumFolder || createAlbumStorageFolder(product?.name || product?.slug || "album-design"));
+  const [files, setFiles] = useState(() => initialPhotos || []);
+  const [dragOver, setDragOver] = useState(false);
+
   useEffect(() => {
-    const demo = [
-      { name: "IMG_0124.jpg", size: "8.4 MB", res: "5472 × 3648", quality: "high", src: stock.weddingCouple },
-      { name: "IMG_0287.jpg", size: "7.1 MB", res: "5472 × 3648", quality: "high", src: stock.weddingFlowers },
-      { name: "IMG_0301.jpg", size: "6.8 MB", res: "5472 × 3648", quality: "high", src: stock.weddingHands },
-      { name: "screenshot.png", size: "1.2 MB", res: "1024 × 768", quality: "low", src: stock.weddingMandap },
-      { name: "IMG_0412.jpg", size: "9.3 MB", res: "6000 × 4000", quality: "high", src: stock.weddingBride },
-      { name: "IMG_0455.jpg", size: "8.7 MB", res: "5472 × 3648", quality: "high", src: stock.weddingHenna },
-      { name: "IMG_0498.heic", size: "4.2 MB", res: "4032 × 3024", quality: "medium", src: stock.weddingDance },
-      { name: "IMG_0512.jpg", size: "9.1 MB", res: "5472 × 3648", quality: "high", src: stock.travelTaj },
-    ];
-    setFiles(demo);
-  }, []);
+    albumFolderRef.current = initialAlbumFolder || createAlbumStorageFolder(product?.name || product?.slug || "album-design");
+    setFiles(initialPhotos || []);
+  }, [product.slug]);
+
+  const addSelectedFiles = async (selectedFiles) => {
+    const imageFiles = [...(selectedFiles || [])].filter(isUploadableImageFile);
+    if (!imageFiles.length) return;
+
+    const photos = imageFiles.map((file, index) => {
+      const id = `upload-step-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`;
+      return {
+        id,
+        name: file.name,
+        fileName: file.name,
+        contentType: file.type || "application/octet-stream",
+        size: file.size,
+        sizeLabel: formatUploadFileSize(file.size),
+        res: "Reading...",
+        quality: "checking",
+        src: URL.createObjectURL(file),
+        file,
+        uploading: true,
+        uploaded: false,
+      };
+    });
+
+    setFiles((current) => [...current, ...photos]);
+    photos.forEach(async (photo) => {
+      const { width, height } = await imageResolutionFromUrl(photo.src);
+      setFiles((current) => current.map((item) => (
+        item.id === photo.id
+          ? {
+              ...item,
+              res: width && height ? `${width} × ${height}` : "Unknown resolution",
+              quality: isLowResolutionPhoto(width, height) ? "low" : "high",
+            }
+          : item
+      )));
+    });
+
+    const uploadedPhotos = await uploadStudioPhotosToStorage(imageFiles, photos, albumFolderRef.current);
+    setFiles((current) => current.map((photo) => uploadedPhotos.find((uploaded) => uploaded.id === photo.id) || photo));
+  };
+
+  const continueToStudio = () => {
+    if (files.some((file) => file.uploading || file.uploadError)) return;
+    onContinueWithPhotos?.(product.slug, {
+      albumFolder: albumFolderRef.current,
+      photos: files.map(stripRuntimePhotoFields),
+    });
+    navigate("studio", {
+      slug: product.slug,
+      size: params?.size || "",
+      pages: params?.pages || "",
+      cover: params?.cover || "",
+      paper: params?.paper || "",
+      qty: params?.qty || "",
+    });
+  };
+
+  const requestProfessionalDesign = () => {
+    if (!files.length || files.some((file) => file.uploading || file.uploadError)) return;
+    onProfessionalDesign?.(product.slug, {
+      projectName: `${product.name} team design`,
+      albumFolder: albumFolderRef.current,
+      assets: files.map(stripRuntimePhotoFields),
+      details: {
+        ...selectedDetails,
+      },
+      qty: params?.qty || 1,
+    });
+    navigate("cart");
+  };
 
   const lowQualityCount = files.filter(f => f.quality === "low").length;
+  const uploadingCount = files.filter(f => f.uploading).length;
+  const failedCount = files.filter(f => f.uploadError).length;
+  const canContinue = uploadingCount === 0 && failedCount === 0;
+  const canUseUploadedPhotos = files.length > 0 && canContinue;
 
   return (
     <div className="upload-page">
@@ -84,7 +183,7 @@ export function UploadPage({ navigate, params, products = [], stock = {}, SmartI
               <div
                 onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
                 onDragLeave={() => setDragOver(false)}
-                onDrop={(e) => { e.preventDefault(); setDragOver(false); }}
+                onDrop={(e) => { e.preventDefault(); setDragOver(false); addSelectedFiles(e.dataTransfer.files); }}
                 style={{
                   border: `2px dashed ${dragOver ? "var(--accent)" : "var(--line-2)"}`,
                   background: dragOver ? "rgba(154,107,63,0.06)" : "var(--paper)",
@@ -95,10 +194,11 @@ export function UploadPage({ navigate, params, products = [], stock = {}, SmartI
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17,8 12,3 7,8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
                 </div>
                 <div style={{ fontSize: 16, marginBottom: 8 }}>Drop your photos here</div>
-                <div style={{ fontSize: 13, color: "var(--muted)" }}>or <a style={{ color: "var(--accent-deep)", cursor: "pointer", textDecoration: "underline", textUnderlineOffset: 3 }}>browse from your computer</a></div>
+                <div style={{ fontSize: 13, color: "var(--muted)" }}>or <a onClick={() => inputRef.current?.click()} style={{ color: "var(--accent-deep)", cursor: "pointer", textDecoration: "underline", textUnderlineOffset: 3 }}>browse from your computer</a></div>
                 <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 16, letterSpacing: 0.04 }}>
                   JPG · PNG · TIFF · HEIC · up to 50MB per file · stored on encrypted S3
                 </div>
+                <input ref={inputRef} type="file" accept="image/*,.heic,.heif,.tif,.tiff" multiple onChange={(event) => { addSelectedFiles(event.target.files); event.target.value = ""; }} style={{ display: "none" }} />
               </div>
 
               {/* Files */}
@@ -106,19 +206,25 @@ export function UploadPage({ navigate, params, products = [], stock = {}, SmartI
                 <div>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
                     <div style={{ fontSize: 13 }}>
-                      <strong>{files.length}</strong> photos uploaded
+                      <strong>{files.length}</strong> photos selected
+                      {uploadingCount > 0 && (
+                        <span style={{ marginLeft: 12, color: "var(--accent-deep)", fontSize: 12 }}>· {uploadingCount} uploading</span>
+                      )}
+                      {failedCount > 0 && (
+                        <span style={{ marginLeft: 12, color: "var(--rust)", fontSize: 12 }}>· {failedCount} failed</span>
+                      )}
                       {lowQualityCount > 0 && (
                         <span style={{ marginLeft: 12, color: "var(--rust)", fontSize: 12 }}>· {lowQualityCount} need attention</span>
                       )}
                     </div>
                     <div style={{ display: "flex", gap: 8 }}>
-                      <button className="btn btn-ghost btn-sm">Sort by date</button>
-                      <button className="btn btn-ghost btn-sm" style={{ color: "var(--rust)" }}>Remove all</button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => setFiles((current) => [...current].sort((a, b) => String(a.name).localeCompare(String(b.name))))}>Sort by name</button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => setFiles([])} style={{ color: "var(--rust)" }}>Remove all</button>
                     </div>
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12 }}>
-                    {files.map((f, i) => (
-                      <div key={i} style={{ position: "relative", borderRadius: "var(--r-md)", overflow: "hidden", border: f.quality === "low" ? "2px solid var(--rust)" : "1px solid var(--line)" }}>
+                    {files.map((f) => (
+                      <div key={f.id} style={{ position: "relative", borderRadius: "var(--r-md)", overflow: "hidden", border: f.quality === "low" ? "2px solid var(--rust)" : "1px solid var(--line)" }}>
                         <div style={{ aspectRatio: "1" }}>
                           <SmartImage src={f.src} className="img-fill" />
                         </div>
@@ -127,14 +233,19 @@ export function UploadPage({ navigate, params, products = [], stock = {}, SmartI
                             Low resolution
                           </div>
                         )}
+                        {(f.uploading || f.uploadError) && (
+                          <div style={{ position: "absolute", left: 8, bottom: 48, right: 8, padding: "6px 8px", background: f.uploadError ? "rgba(168,87,48,0.95)" : "rgba(28,26,23,0.82)", color: "white", borderRadius: 6, fontSize: 10, letterSpacing: 0.04, textAlign: "center" }} title={f.uploadError || ""}>
+                            {f.uploadError ? "Upload failed" : "Uploading"}
+                          </div>
+                        )}
                         <div style={{ position: "absolute", top: 8, right: 8 }}>
-                          <button className="icon-btn" style={{ width: 26, height: 26, background: "rgba(255,255,255,0.9)" }}>
+                          <button className="icon-btn" onClick={() => setFiles((current) => current.filter((item) => item.id !== f.id))} style={{ width: 26, height: 26, background: "rgba(255,255,255,0.9)" }}>
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                           </button>
                         </div>
                         <div style={{ padding: "8px 10px", background: "var(--paper)", fontSize: 11, lineHeight: 1.4 }}>
                           <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
-                          <div style={{ color: "var(--muted)", fontSize: 10 }}>{f.res} · {f.size}</div>
+                          <div style={{ color: "var(--muted)", fontSize: 10 }}>{f.res} · {f.sizeLabel || formatUploadFileSize(f.size)}</div>
                         </div>
                       </div>
                     ))}
@@ -153,7 +264,7 @@ export function UploadPage({ navigate, params, products = [], stock = {}, SmartI
                   <div>
                     <div style={{ fontSize: 11, color: "var(--muted)", letterSpacing: 0.06, textTransform: "uppercase" }}>{product.tier}</div>
                     <div style={{ fontSize: 16, marginTop: 2, marginBottom: 2 }}>{product.name}</div>
-                    <div style={{ fontSize: 12, color: "var(--muted)" }}>12×12 in · 60 pages · Linen</div>
+                    <div style={{ fontSize: 12, color: "var(--muted)" }}>{[selectedDetails.size, selectedDetails.pages ? `${selectedDetails.pages} pages` : "", selectedDetails.cover].filter(Boolean).join(" · ")}</div>
                   </div>
                 </div>
                 <div style={{ display: "flex", flexDirection: "column", gap: 8, fontSize: 13, marginBottom: 20 }}>
@@ -162,15 +273,18 @@ export function UploadPage({ navigate, params, products = [], stock = {}, SmartI
                     <span>40–60</span>
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <span style={{ color: "var(--muted)" }}>Uploaded so far</span>
+                    <span style={{ color: "var(--muted)" }}>Selected so far</span>
                     <span>{files.length}</span>
                   </div>
                 </div>
-                <button className="btn btn-primary" style={{ width: "100%" }} onClick={() => navigate("studio", { slug: product.slug })}>
-                  Continue to Design Studio →
+                <button className="btn btn-primary" style={{ width: "100%", opacity: canContinue ? 1 : 0.55, cursor: canContinue ? "pointer" : "default" }} onClick={continueToStudio} disabled={!canContinue}>
+                  {uploadingCount > 0 ? "Uploading photos..." : failedCount > 0 ? "Remove failed uploads" : "Continue to Design Studio →"}
+                </button>
+                <button className="btn btn-ghost" style={{ width: "100%", marginTop: 10, opacity: canUseUploadedPhotos ? 1 : 0.55, cursor: canUseUploadedPhotos ? "pointer" : "default" }} onClick={requestProfessionalDesign} disabled={!canUseUploadedPhotos}>
+                  Let our team design it
                 </button>
                 <div style={{ fontSize: 11, color: "var(--muted)", textAlign: "center", marginTop: 12 }}>
-                  Your work is saved automatically.
+                  Choose Studio to design yourself, or let our internal team build it from these uploaded photos.
                 </div>
               </div>
 
@@ -191,8 +305,9 @@ export function UploadPage({ navigate, params, products = [], stock = {}, SmartI
 function Stepper({ current, navigate, slug }) {
   const steps = [
     { n: 1, label: "Choose book", page: "product" },
-    { n: 2, label: "Design Studio", page: "studio" },
-    { n: 3, label: "Review & checkout", page: "checkout" },
+    { n: 2, label: "Upload photos", page: "upload" },
+    { n: 3, label: "Design Studio", page: "studio" },
+    { n: 4, label: "Review & checkout", page: "checkout" },
   ];
   return (
     <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 20 }}>
@@ -307,6 +422,65 @@ function createAlbumStorageFolder(projectName) {
 function buildAlbumStoragePath(albumFolder, section, fileName) {
   const id = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   return `${albumFolder}/${section}/${id}-${cleanStorageName(fileName || "asset", "asset")}`;
+}
+
+async function uploadStudioPhotosToStorage(files, pendingPhotos, albumFolder) {
+  return Promise.all(pendingPhotos.map(async (photo, index) => {
+    const file = files[index] || photo.file;
+    if (!file) return photo;
+
+    try {
+      const signResponse = await fetch(studioApiUrl("/api/upload-url"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fileName: file.name,
+          contentType: file.type || "application/octet-stream",
+          size: file.size,
+          path: buildAlbumStoragePath(albumFolder, "photos", file.name),
+        }),
+      });
+      const signData = await signResponse.json().catch(() => ({}));
+      if (!signResponse.ok) {
+        throw new Error(signData.error || `Photo upload setup failed with ${signResponse.status}`);
+      }
+      if (!signData.uploadUrl) {
+        throw new Error("The upload endpoint did not return a signed URL.");
+      }
+
+      const uploadResponse = await uploadToSignedStorageUrl(signData.uploadUrl, file, {
+        fileName: file.name,
+        contentType: file.type || "application/octet-stream",
+      });
+      if (!uploadResponse.ok) {
+        const uploadError = await uploadResponse.text().catch(() => "");
+        throw new Error(`Supabase photo upload failed with ${uploadResponse.status}${uploadError ? `: ${uploadError}` : ""}`);
+      }
+
+      const previewResponse = await fetch(studioApiUrl(`/api/photo-url?bucket=${encodeURIComponent(signData.bucket)}&path=${encodeURIComponent(signData.path)}`));
+      const previewData = await previewResponse.json().catch(() => ({}));
+      if (!previewResponse.ok) {
+        throw new Error(previewData.error || `Photo preview setup failed with ${previewResponse.status}`);
+      }
+
+      return {
+        ...photo,
+        localSrc: photo.src,
+        src: previewData.signedUrl || photo.src,
+        storagePath: signData.path,
+        storageBucket: signData.bucket,
+        uploading: false,
+        uploaded: true,
+      };
+    } catch (error) {
+      return {
+        ...photo,
+        uploading: false,
+        uploaded: false,
+        uploadError: error.message || "Photo upload failed; using a temporary preview.",
+      };
+    }
+  }));
 }
 
 function photoPatch(photoOrSrc) {
@@ -432,6 +606,15 @@ function cloneStudioSpreads(spreads) {
   }));
 }
 
+function shuffleStudioPhotos(photos) {
+  const shuffled = [...photos];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  return shuffled;
+}
+
 function isEditableTarget(target) {
   if (!target) return false;
   const tagName = target.tagName?.toLowerCase();
@@ -510,7 +693,23 @@ async function convertImageToPdfJpeg(src, options = {}) {
   });
 }
 
+async function loadOriginalPdfJpeg(src) {
+  const [response, size] = await Promise.all([fetch(src, { mode: "cors" }), getImageSize(src)]);
+  const blob = await response.blob();
+  if (!blob.type.includes("jpeg") && !blob.type.includes("jpg")) return null;
+  return { ...size, bytes: new Uint8Array(await blob.arrayBuffer()) };
+}
+
 async function loadPdfImage(src, options = {}) {
+  if (options.preferOriginal) {
+    try {
+      const originalImage = await loadOriginalPdfJpeg(src);
+      if (originalImage) return originalImage;
+    } catch {
+      // Fall through to canvas rendering for formats that cannot be embedded directly.
+    }
+  }
+
   try {
     return await convertImageToPdfJpeg(src, options);
   } catch {
@@ -518,10 +717,7 @@ async function loadPdfImage(src, options = {}) {
   }
   if (options.allowOriginalFallback === false) return null;
   try {
-    const [response, size] = await Promise.all([fetch(src, { mode: "cors" }), getImageSize(src)]);
-    const blob = await response.blob();
-    if (!blob.type.includes("jpeg") && !blob.type.includes("jpg")) return null;
-    return { ...size, bytes: new Uint8Array(await blob.arrayBuffer()) };
+    return await loadOriginalPdfJpeg(src);
   } catch {
     return null;
   }
@@ -678,7 +874,7 @@ export async function downloadStudioPdf(spreads, projectName) {
   URL.revokeObjectURL(url);
 }
 
-export function StudioPage({ navigate, params, products = [], SmartImage = DefaultSmartImage, Logo = DefaultLogo, initialAlbumDesign = null, onSaveAlbumDesign }) {
+export function StudioPage({ navigate, params, products = [], SmartImage = DefaultSmartImage, Logo = DefaultLogo, initialAlbumDesign = null, initialPhotoLibrary = [], initialAlbumFolder = "", onSaveAlbumDesign }) {
   const product = products.find(p => p.slug === params?.slug) || products[0];
   const [activeTool, setActiveTool] = useState("photos");
   const [activeSpread, setActiveSpread] = useState(0);
@@ -693,10 +889,10 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
   const [saveError, setSaveError] = useState("");
   const [previewOpen, setPreviewOpen] = useState(false);
   const uploadInputRef = useRef(null);
-  const albumFolderRef = useRef(initialAlbumDesign?.albumFolder || initialAlbumDesign?.storageFolder || "");
+  const albumFolderRef = useRef(initialAlbumDesign?.albumFolder || initialAlbumDesign?.storageFolder || initialAlbumFolder || "");
   const historyRef = useRef([]);
   const clipboardRef = useRef(null);
-  const [photoBin, setPhotoBin] = useState(() => initialAlbumDesign?.photoLibrary || photoLibraryFromDesign(initialAlbumDesign?.spreads || []));
+  const [photoBin, setPhotoBin] = useState(() => initialAlbumDesign?.photoLibrary || (initialPhotoLibrary?.length ? initialPhotoLibrary : photoLibraryFromDesign(initialAlbumDesign?.spreads || [])));
 
   // Spreads (left/right pages)
   const [spreads, setSpreads] = useState(() => initialAlbumDesign?.spreads?.length ? initialAlbumDesign.spreads.map(normalizeStudioSpread) : defaultStudioSpreads());
@@ -995,10 +1191,22 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
     setActiveTool("photos");
   };
 
+  const uploadPhotosToStorage = async (files, pendingPhotos) => {
+    const uploadedPhotos = await uploadStudioPhotosToStorage(files, pendingPhotos, getAlbumFolder());
+
+    setPhotoBin((current) => current.map((photo) => uploadedPhotos.find((uploaded) => uploaded.id === photo.id) || photo));
+    setSpreads((current) => current.map((spread) => ({
+      ...spread,
+      items: (spread.items || []).map((item) => {
+        const uploaded = uploadedPhotos.find((photo) => photo.uploaded && (item.src === photo.localSrc || item.id === photo.id));
+        return uploaded ? { ...item, ...photoPatch(uploaded) } : item;
+      }),
+    })));
+  };
+
   const handleUploadLibrary = async (event) => {
     const files = [...event.target.files];
     if (!files.length) return;
-    const targetAlbumFolder = getAlbumFolder();
     const pendingPhotos = files.map((file, index) => ({
       id: `upload-${Date.now()}-${index}`,
       name: file.name,
@@ -1006,66 +1214,55 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
       contentType: file.type || "application/octet-stream",
       size: file.size,
       src: URL.createObjectURL(file),
+      file,
       uploading: true,
     }));
     setPhotoBin((current) => [...current, ...pendingPhotos]);
     event.target.value = "";
+    await uploadPhotosToStorage(files, pendingPhotos);
+  };
 
-    const uploadedPhotos = await Promise.all(pendingPhotos.map(async (photo, index) => {
-      const file = files[index];
-      try {
-        const signResponse = await fetch(studioApiUrl("/api/upload-url"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            fileName: file.name,
-            contentType: file.type || "application/octet-stream",
-            size: file.size,
-            path: buildAlbumStoragePath(targetAlbumFolder, "photos", file.name),
-          }),
-        });
-        const signData = await signResponse.json().catch(() => ({}));
-        if (!signResponse.ok) {
-          throw new Error(signData.error || `Photo upload setup failed with ${signResponse.status}`);
-        }
-        if (!signData.uploadUrl) {
-          throw new Error("The upload endpoint did not return a signed URL.");
-        }
+  const randomFillAllSpreads = () => {
+    const availablePhotos = photoBin.filter((photo) => photo.src && !photo.uploading && !photo.uploadError);
+    if (!availablePhotos.length) return;
 
-        const uploadResponse = await uploadToSignedStorageUrl(signData.uploadUrl, file, {
-          fileName: file.name,
-          contentType: file.type || "application/octet-stream",
-        });
-        if (!uploadResponse.ok) {
-          const uploadError = await uploadResponse.text().catch(() => "");
-          throw new Error(`Supabase photo upload failed with ${uploadResponse.status}${uploadError ? `: ${uploadError}` : ""}`);
-        }
+    setSpreads((current) => {
+      historyRef.current = [...historyRef.current.slice(-39), cloneStudioSpreads(current)];
+      let deck = shuffleStudioPhotos(availablePhotos);
+      let cursor = 0;
+      return current.map((spread) => ({
+        ...spread,
+        items: (spread.items || []).map((item) => {
+          if (cursor > 0 && cursor % deck.length === 0) deck = shuffleStudioPhotos(availablePhotos);
+          const photo = deck[cursor % deck.length];
+          cursor += 1;
+          return {
+            ...item,
+            ...photoPatch(photo),
+            focalX: 50,
+            focalY: 50,
+          };
+        }),
+      }));
+    });
+    setSelectedItemIdsBySpread({});
+    setSelectedTextIdsBySpread({});
+    setActiveSpread(0);
+    setActiveTool("photos");
+    setSavedAt(new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
+  };
 
-        const previewResponse = await fetch(studioApiUrl(`/api/photo-url?bucket=${encodeURIComponent(signData.bucket)}&path=${encodeURIComponent(signData.path)}`));
-        const previewData = await previewResponse.json().catch(() => ({}));
-        if (!previewResponse.ok) {
-          throw new Error(previewData.error || `Photo preview setup failed with ${previewResponse.status}`);
-        }
-
-        return {
-          ...photo,
-          src: previewData.signedUrl || photo.src,
-          storagePath: signData.path,
-          storageBucket: signData.bucket,
-          uploading: false,
-          uploaded: true,
-        };
-      } catch (error) {
-        return {
-          ...photo,
-          uploading: false,
-          uploaded: false,
-          uploadError: error.message || "Photo upload failed; using a temporary preview.",
-        };
-      }
-    }));
-
-    setPhotoBin((current) => current.map((photo) => uploadedPhotos.find((uploaded) => uploaded.id === photo.id) || photo));
+  const restartDesignFromScratch = () => {
+    setSpreads((current) => {
+      historyRef.current = [...historyRef.current.slice(-39), cloneStudioSpreads(current)];
+      return defaultStudioSpreads();
+    });
+    setSelectedItemIdsBySpread({});
+    setSelectedTextIdsBySpread({});
+    setActiveSpread(0);
+    setActiveTool("photos");
+    setSaveError("");
+    setSavedAt(new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
   };
 
   const autofillRemaining = () => {
@@ -1095,9 +1292,9 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
   const uploadDesignPdf = async () => {
     const pdfBlob = await createStudioPdfBlob(spreads, {
       image: {
-        maxDimension: 1800,
-        quality: 0.82,
-        allowOriginalFallback: false,
+        maxDimension: Number.POSITIVE_INFINITY,
+        quality: 1,
+        preferOriginal: true,
       },
     });
     const savedStamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -1151,13 +1348,20 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
     productSlug: product?.slug,
     projectName,
     albumFolder: getAlbumFolder(),
+    details: {
+      size: params?.size || product?.sizes?.[0] || "",
+      pages: params?.pages || product?.pages?.[1] || product?.pages?.[0] || "",
+      cover: params?.cover || product?.cover?.[0] || "",
+      paper: params?.paper || product?.paper?.[0] || "",
+    },
+    qty: Number(params?.qty || 1),
     designPdf,
     isComplete: albumReady,
     filledSlots,
     totalSlots,
     spreadCount: spreads.length,
     pageCount: spreads.reduce((count, spread) => count + (isCoverLayout(spread.layout) ? 1 : 2), 0),
-    photoLibrary: photoBin.map((photo) => ({ ...photo })),
+    photoLibrary: photoBin.map(({ file, localSrc, ...photo }) => ({ ...photo })),
     spreads: cloneStudioSpreads(spreads),
     savedAt: new Date().toISOString(),
   });
@@ -1218,7 +1422,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
     <StudioComponentContext.Provider value={{ SmartImage, Logo }}>
       <div className="studio-app" style={{ background: "var(--ink)", color: "var(--paper)", height: "calc(100vh - 50px)", minHeight: 640, display: "flex", flexDirection: "column", overflow: "hidden" }}>
       {/* Top toolbar */}
-      <StudioTopbar projectName={projectName} setProjectName={setProjectName} savedAt={savedAt} navigate={navigate} product={product} albumReady={albumReady} filledSlots={filledSlots} totalSlots={totalSlots} onPreview={() => setPreviewOpen(true)} onDownloadPdf={handleDownloadPdf} onSaveAndCheckout={handleSaveAndCheckout} exportingPdf={exportingPdf} savingDesign={savingDesign} saveError={saveError} />
+      <StudioTopbar projectName={projectName} setProjectName={setProjectName} savedAt={savedAt} navigate={navigate} product={product} albumReady={albumReady} filledSlots={filledSlots} totalSlots={totalSlots} onPreview={() => setPreviewOpen(true)} onDownloadPdf={handleDownloadPdf} onSaveAndCheckout={handleSaveAndCheckout} onRandomFill={randomFillAllSpreads} onRestartDesign={restartDesignFromScratch} hasPhotos={photoBin.some((photo) => photo.src && !photo.uploading && !photo.uploadError)} exportingPdf={exportingPdf} savingDesign={savingDesign} saveError={saveError} />
 
       <div style={{ flex: 1, display: "grid", gridTemplateColumns: "72px 280px 1fr 320px", overflow: "hidden", minHeight: 0 }}>
         {/* Tool rail */}
@@ -1233,7 +1437,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
         {/* Right panel */}
         <StudioRightPanel layout={activeLayout} setLayout={applyLayout} aspectFilter={aspectFilter} setAspectFilter={setAspectFilter} selectedItem={selectedItem} onUpdateItem={updateItem} onAddImageSection={addImageSection} onRemoveImageSection={() => selectedItem && removeImageSection(selectedItem.id)} onRemoveImage={() => selectedItem && updateItem(selectedItem.id, clearPhotoPatch())} onAutofill={autofillRemaining} albumReady={albumReady} filledSlots={filledSlots} totalSlots={totalSlots} hasPhotos={photoBin.length > 0} />
       </div>
-      <input ref={uploadInputRef} type="file" accept="image/*" multiple onChange={handleUploadLibrary} style={{ display: "none" }} />
+      <input ref={uploadInputRef} type="file" accept="image/*,.heic,.heif,.tif,.tiff" multiple onChange={handleUploadLibrary} style={{ display: "none" }} />
 
       {/* Bottom: page filmstrip */}
       <StudioFilmstrip spreads={spreads} active={activeSpread} setActive={setActiveSpread} onAddSpread={handleAddSpread} />
@@ -1243,7 +1447,7 @@ export function StudioPage({ navigate, params, products = [], SmartImage = Defau
   );
 }
 
-function StudioTopbar({ projectName, setProjectName, savedAt, navigate, product, albumReady, filledSlots, totalSlots, onPreview, onDownloadPdf, onSaveAndCheckout, exportingPdf, savingDesign, saveError }) {
+function StudioTopbar({ projectName, setProjectName, savedAt, navigate, product, albumReady, filledSlots, totalSlots, onPreview, onDownloadPdf, onSaveAndCheckout, onRandomFill, onRestartDesign, hasPhotos, exportingPdf, savingDesign, saveError }) {
   const { Logo } = useStudioComponents();
   return (
     <div style={{ borderBottom: "1px solid rgba(255,255,255,0.08)", padding: "14px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "var(--ink)" }}>
@@ -1277,6 +1481,12 @@ function StudioTopbar({ projectName, setProjectName, savedAt, navigate, product,
         <span style={{ width: 1, height: 18, background: "rgba(255,255,255,0.15)" }}></span>
         <button className="btn btn-sm" onClick={onPreview} style={{ color: "var(--paper)", border: "1px solid rgba(255,255,255,0.2)" }}>
           Preview
+        </button>
+        <button className="btn btn-sm" onClick={onRandomFill} disabled={!hasPhotos} title={hasPhotos ? "Randomly fill every image layer" : "Upload photos before random filling"} style={{ color: "var(--paper)", border: "1px solid rgba(255,255,255,0.2)", opacity: hasPhotos ? 1 : 0.45, cursor: hasPhotos ? "pointer" : "default" }}>
+          Random fill
+        </button>
+        <button className="btn btn-sm" onClick={onRestartDesign} title="Remove all design edits and start again" style={{ color: "var(--paper)", border: "1px solid rgba(255,255,255,0.2)" }}>
+          Restart
         </button>
         {saveError && (
           <span title={saveError} style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--rust)", fontSize: 12 }}>
